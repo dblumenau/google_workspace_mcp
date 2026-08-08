@@ -101,7 +101,7 @@ This project is [MIT licensed](LICENSE) — not "open core," not "source availab
 <tr>
 <td align="center" width="25%">
 <h3>📧</h3><a href="https://workspacemcp.com/gmail"><b>Gmail</b></a><br>
-<sub>15 tools - search, send, draft,<br>labels, filters, attachments</sub>
+<sub>16 tools - search, send, draft lifecycle,<br>labels, filters, attachments</sub>
 </td>
 <td align="center" width="25%">
 <h3>📁</h3><a href="https://workspacemcp.com/google-drive"><b>Drive</b></a><br>

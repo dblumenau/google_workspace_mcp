@@ -111,6 +111,73 @@ def _parse_raw_message(raw_message: str):
 
 
 @pytest.mark.asyncio
+async def test_draft_gmail_message_updates_existing_draft_by_full_replacement():
+    mock_service = Mock()
+    mock_service.users().drafts().update().execute.return_value = {
+        "id": "draft123",
+        "message": {"id": "message456"},
+    }
+
+    result = await _unwrap(draft_gmail_message)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        draft_id="draft123",
+        to="recipient@example.com",
+        subject="Updated subject",
+        body="Updated body",
+        include_signature=False,
+    )
+
+    update_kwargs = (
+        mock_service.users.return_value.drafts.return_value.update.call_args.kwargs
+    )
+    assert update_kwargs["userId"] == "me"
+    assert update_kwargs["id"] == "draft123"
+    parsed = _parse_raw_message(update_kwargs["body"]["message"]["raw"])
+    assert parsed["Subject"] == "Updated subject"
+    assert parsed["To"] == "recipient@example.com"
+    assert parsed.get_body(preferencelist=("plain",)).get_content().strip() == (
+        "Updated body"
+    )
+    assert mock_service.users.return_value.drafts.return_value.create.call_count == 0
+    assert "Draft updated! Draft ID: draft123; Message ID: message456" in result
+
+
+@pytest.mark.asyncio
+async def test_draft_gmail_message_update_preserves_reply_threading():
+    mock_service = Mock()
+    mock_service.users().drafts().update().execute.return_value = {
+        "id": "draft_reply",
+        "message": {"id": "new_message"},
+    }
+    mock_service.users().threads().get().execute.return_value = _thread_response(
+        "<msg1@example.com>",
+        "<msg2@example.com>",
+    )
+
+    await _unwrap(draft_gmail_message)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        draft_id="draft_reply",
+        to="recipient@example.com",
+        subject="Meeting tomorrow",
+        body="Updated reply",
+        thread_id="thread123",
+        include_signature=False,
+    )
+
+    update_kwargs = (
+        mock_service.users.return_value.drafts.return_value.update.call_args.kwargs
+    )
+    assert update_kwargs["body"]["message"]["threadId"] == "thread123"
+    raw_text = base64.urlsafe_b64decode(update_kwargs["body"]["message"]["raw"]).decode(
+        "utf-8", errors="ignore"
+    )
+    assert "In-Reply-To: <msg2@example.com>" in raw_text
+    assert "References: <msg1@example.com> <msg2@example.com>" in raw_text
+
+
+@pytest.mark.asyncio
 async def test_draft_gmail_message_reports_actual_attachment_count(
     tmp_path, monkeypatch
 ):
