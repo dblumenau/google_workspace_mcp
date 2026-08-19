@@ -11,8 +11,9 @@ from typing import Any, Callable
 from unittest.mock import Mock
 
 import pytest
+from fastmcp.exceptions import ToolError
 from fastmcp.tools import ToolResult
-from mcp.types import BlobResourceContents, EmbeddedResource, TextContent
+from mcp.types import BlobResourceContents, EmbeddedResource, ResourceLink, TextContent
 
 from core.server import server
 from core.tool_registry import get_tool_components
@@ -195,7 +196,11 @@ async def test_default_call_omits_base64_content(isolated_attachment_env):
     assert str(resource.resource.uri).endswith("/test.png")
     assert resource.resource.mimeType == "image/png"
     assert base64.b64decode(resource.resource.blob) == payload
-    assert result.structured_content == {"result": _result_text(result)}
+    assert result.structured_content["result"] == _result_text(result)
+    assert result.structured_content["filename"] == "test.png"
+    assert result.structured_content["mime_type"] == "image/png"
+    assert result.structured_content["size"] == len(payload)
+    assert result.structured_content["workspace_file_id"]
 
 
 @pytest.mark.asyncio
@@ -222,9 +227,7 @@ async def test_include_file_false_omits_embedded_resource(isolated_attachment_en
 @pytest.mark.asyncio
 async def test_stateless_mode_still_returns_portable_file(monkeypatch):
     """Diskless deployments should return the attachment through MCP itself."""
-    import auth.oauth_config as oauth_config_module
-
-    monkeypatch.setattr(oauth_config_module, "is_stateless_mode", lambda: True)
+    monkeypatch.setattr("gmail.gmail_tools.is_stateless_mode", lambda: True)
     payload = b"portable stateless attachment"
     mock_service = _build_mock_service(
         payload, filename="portable.txt", mime_type="text/plain"
@@ -242,7 +245,8 @@ async def test_stateless_mode_still_returns_portable_file(monkeypatch):
     assert isinstance(resource.resource, BlobResourceContents)
     assert str(resource.resource.uri).endswith("/portable.txt")
     assert base64.b64decode(resource.resource.blob) == payload
-    assert "Stateless mode" in _result_text(result)
+    assert "Portable MCP file: included" in _result_text(result)
+    assert "workspace_file_id" not in result.structured_content
 
 
 @pytest.mark.asyncio
@@ -564,3 +568,41 @@ async def test_resolves_correct_filename_for_nested_smime_attachment(
     assert len(saved_files) == 1
     assert saved_files[0].suffix == ".pdf"
     assert saved_files[0].read_bytes() == payload
+
+
+@pytest.mark.asyncio
+async def test_stateless_attachment_over_inline_limit_errors(monkeypatch):
+    monkeypatch.setattr("gmail.gmail_tools.is_stateless_mode", lambda: True)
+    monkeypatch.setenv("WORKSPACE_MCP_INLINE_FILE_MAX_BYTES", "4")
+    service = _build_mock_service(b"abcde", filename="large.bin")
+
+    with pytest.raises(ToolError, match="stateless mode cannot stage"):
+        await _unwrap(get_gmail_attachment_content)(
+            service=service,
+            message_id="msg-1",
+            attachment_id="att-123",
+            user_google_email="user@example.com",
+        )
+
+
+@pytest.mark.asyncio
+async def test_stateful_attachment_over_inline_limit_returns_link(
+    isolated_attachment_env, monkeypatch
+):
+    monkeypatch.setenv("WORKSPACE_MCP_INLINE_FILE_MAX_BYTES", "4")
+    monkeypatch.setattr(
+        "core.file_delivery.get_attachment_url",
+        lambda file_id: f"https://files.example/attachments/{file_id}",
+    )
+    service = _build_mock_service(b"abcde", filename="large.bin")
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+    )
+
+    assert any(isinstance(item, ResourceLink) for item in result.content)
+    assert not any(isinstance(item, EmbeddedResource) for item in result.content)
+    assert result.structured_content["workspace_file_id"]

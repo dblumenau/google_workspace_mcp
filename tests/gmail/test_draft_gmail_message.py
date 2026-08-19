@@ -220,7 +220,7 @@ async def test_draft_gmail_message_raises_when_no_attachments_are_added(
     mock_service = Mock()
     mock_service.users().drafts().create().execute.return_value = {"id": "draft123"}
 
-    with pytest.raises(UserInputError, match="No valid attachments were added"):
+    with pytest.raises(UserInputError, match="Failed to resolve attachment"):
         await _unwrap(draft_gmail_message)(
             service=mock_service,
             user_google_email="user@example.com",
@@ -259,9 +259,8 @@ async def test_draft_gmail_message_surfaces_guidance_for_paths_outside_allowed_d
         )
 
     message = str(exc_info.value)
-    assert "No valid attachments were added" in message
+    assert "Failed to resolve attachment" in message
     assert "permitted directories" in message
-    assert "external mounts such as /run/media may be blocked" in message
     assert str(blocked_path) in message
 
 
@@ -933,14 +932,59 @@ async def test_resolve_url_attachments_fetches_external_url(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_resolve_url_attachments_preserves_non_url_entries():
-    """Entries with path or content should pass through unchanged."""
-    attachments = [
-        {"path": "/some/file.txt"},
-        {"content": "aGVsbG8=", "filename": "hello.txt"},
-    ]
+async def test_resolve_url_attachments_resolves_legacy_base64_entries():
+    """Legacy content is validated and normalized before Gmail mutation."""
+    attachments = [{"content": "aGVsbG8=", "filename": "hello.txt"}]
     resolved = await _resolve_url_attachments(attachments)
-    assert resolved == attachments
+    assert resolved == [
+        {
+            "_resolved_bytes": b"hello",
+            "filename": "hello.txt",
+            "mime_type": "text/plain",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_resolve_attachments_accepts_workspace_file_id(monkeypatch, tmp_path):
+    import core.attachment_storage as attachment_storage
+    import core.file_sources as file_sources
+    from core.attachment_storage import AttachmentStorage
+
+    monkeypatch.setattr(attachment_storage, "STORAGE_DIR", tmp_path)
+    storage = AttachmentStorage()
+    saved = storage.save_attachment(
+        base64.urlsafe_b64encode(b"workspace attachment").decode(),
+        filename="report.txt",
+        mime_type="text/plain",
+    )
+    monkeypatch.setattr(file_sources, "get_attachment_storage", lambda: storage)
+
+    resolved = await _resolve_url_attachments(
+        [{"workspace_file_id": saved.file_id}]
+    )
+    assert resolved[0]["_resolved_bytes"] == b"workspace attachment"
+    assert resolved[0]["filename"] == "report.txt"
+
+
+@pytest.mark.asyncio
+async def test_resolve_attachments_enforces_decoded_total(monkeypatch):
+    monkeypatch.setattr(gmail_tools, "MAX_EMAIL_ATTACHMENT_BYTES", 4)
+    accepted = await _resolve_url_attachments(
+        [
+            {"content": "YWI=", "filename": "a.txt"},
+            {"content": "Y2Q=", "filename": "b.txt"},
+        ]
+    )
+    assert sum(len(item["_resolved_bytes"]) for item in accepted) == 4
+
+    with pytest.raises(UserInputError, match="decoded attachment total"):
+        await _resolve_url_attachments(
+            [
+                {"content": "YWI=", "filename": "a.txt"},
+                {"content": "Y2Rl", "filename": "b.txt"},
+            ]
+        )
 
 
 @pytest.mark.asyncio
@@ -963,7 +1007,7 @@ async def test_resolve_url_attachments_uses_provided_filename(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_resolve_url_attachments_rejects_oversized(monkeypatch):
-    """Attachments exceeding 25 MB should be skipped (passed through for error)."""
+    """Attachments exceeding 25 MiB abort before Gmail mutation."""
     big_data = b"x" * (26 * 1024 * 1024)
     fake_response = _FakeStreamResponse(
         200,
@@ -976,10 +1020,8 @@ async def test_resolve_url_attachments_rejects_oversized(monkeypatch):
     )
 
     attachments = [{"url": "https://example.com/huge.bin"}]
-    resolved = await _resolve_url_attachments(attachments)
-    # Should pass through the original dict (no _resolved_bytes).
-    assert "_resolved_bytes" not in resolved[0]
-    assert resolved[0]["url"] == "https://example.com/huge.bin"
+    with pytest.raises(UserInputError, match="exceeds 25 MB"):
+        await _resolve_url_attachments(attachments)
 
 
 @pytest.mark.asyncio

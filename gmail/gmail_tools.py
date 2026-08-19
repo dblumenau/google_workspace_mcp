@@ -16,7 +16,7 @@ import html
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Annotated, Optional, List, Dict, Literal, Any
-from urllib.parse import quote, unquote, urlparse, urlunsplit
+from urllib.parse import unquote, urlparse, urlunsplit
 
 from email.message import EmailMessage
 from email.policy import SMTP
@@ -24,22 +24,15 @@ from email.utils import formataddr
 
 import httpx
 from fastmcp.tools import ToolResult
-from mcp.types import (
-    BlobResourceContents,
-    EmbeddedResource,
-    TextContent,
-    ToolAnnotations,
-)
+from mcp.types import ToolAnnotations
 
 from pydantic import Field
 from googleapiclient.errors import HttpError
 
-from auth.oauth_config import is_stateless_mode
+import auth.oauth_config as oauth_config
 from auth.service_decorator import require_google_service
 from core.attachment_storage import (
     get_attachment_storage,
-    get_attachment_url,
-    sanitize_attachment_filename,
     STORAGE_DIR,
 )
 from core.config import (
@@ -47,6 +40,12 @@ from core.config import (
     WORKSPACE_EXTERNAL_URL,
     WORKSPACE_MCP_BASE_URI,
     WORKSPACE_MCP_PORT,
+)
+from core.file_delivery import deliver_file_bytes
+from core.file_sources import (
+    EmailAttachmentList,
+    EmailAttachmentSource,
+    resolve_local_file_source,
 )
 from core.http_utils import ssrf_safe_stream
 from core.utils import (
@@ -59,7 +58,6 @@ from core.utils import (
     UserInputError,
     StringList,
     JsonDict,
-    DictList,
 )
 from core.server import server
 from auth.scopes import (
@@ -84,6 +82,11 @@ from gmail.gmail_helpers import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def is_stateless_mode() -> bool:
+    """Resolve stateless mode dynamically for startup configuration and tests."""
+    return oauth_config.is_stateless_mode()
 
 GMAIL_BATCH_SIZE = 25
 # Smaller chunks for search-result header fetches: the batch endpoint executes
@@ -357,15 +360,10 @@ async def _export_full_message(
     message_id: str,
     headers: Dict[str, str],
     body_format: Literal["text", "html", "raw"],
-) -> str:
+) -> ToolResult | str:
     """
-    Return a message's complete, untruncated content: saved to local storage and
-    referenced by download URL (HTTP transport) or file path (stdio transport), or —
-    in stateless mode, where there is no storage — inlined in the response.
-
-    Whenever a file is written the body is kept out of the returned string, which is
-    the point of the export: large messages are handed off out-of-band instead of
-    through the model context. Either way no truncation limit applies.
+    Return a message's complete, untruncated content as a portable MCP file or
+    a temporary download link when it is too large to embed.
 
     Args:
         service: Authenticated Gmail API service.
@@ -375,8 +373,7 @@ async def _export_full_message(
             "html" saves the raw HTML body, "text" saves the plaintext body.
 
     Returns:
-        str: Header summary plus the saved file's URL or path (or the inline body in
-            stateless mode), or an "Error:" string.
+        ToolResult | str: Header summary and portable file delivery, or an error.
     """
     subject = headers.get("Subject", "message") or "message"
     notes: List[str] = []
@@ -442,77 +439,25 @@ async def _export_full_message(
             return "Error: message has no readable body content to export."
         content_bytes = content_str.encode("utf-8")
 
-    # Stateless deployments have no persistent storage to hand a file reference off
-    # from, but the guarantee callers actually want is "complete and untruncated".
-    # Inline delivery satisfies that; it only costs model context.
-    stateless = is_stateless_mode()
-
     size_bytes = len(content_bytes)
     size_kb = size_bytes / 1024
     result_lines = _format_message_header_lines(headers)
-    result_lines.append(
-        "\n--- FULL MESSAGE ---" if stateless else "\n--- FULL MESSAGE EXPORT ---"
-    )
+    result_lines.append("\n--- FULL MESSAGE EXPORT ---")
     result_lines.append(f"Format: {extension.lstrip('.')}")
     result_lines.append(f"Size: {size_kb:.1f} KB ({size_bytes} bytes)")
-
-    if stateless:
-        for note in notes:
-            result_lines.append(f"Note: {note}")
-        result_lines.append(
-            "\nStateless mode: no file storage available, so the complete message is "
-            "included inline below instead of as a download URL. It is NOT truncated."
-        )
-        result_lines.append(
-            "\n--- BODY (COMPLETE, NOT TRUNCATED) ---\n"
-            f"{content_bytes.decode('utf-8', errors='replace')}"
-        )
-        logger.info(
-            f"[get_gmail_message_content] Returned {size_kb:.1f} KB "
-            f"({extension.lstrip('.')}) inline (stateless mode)"
-        )
-        return "\n".join(result_lines)
-
-    # Encode + write on a worker thread so a large export doesn't block the event loop.
-    # Cap the sender-controlled subject so a pathologically long Subject can't overflow
-    # the filesystem's filename limit, and surface a clean error if the write fails.
-    storage = get_attachment_storage()
-
-    def _save_export():
-        return storage.save_attachment(
-            base64_data=base64.urlsafe_b64encode(content_bytes).decode("ascii"),
-            filename=f"{subject[:80]}{extension}",
-            mime_type=mime_type,
-        )
-
-    try:
-        saved = await asyncio.to_thread(_save_export)
-    except OSError as exc:
-        logger.error(f"[get_gmail_message_content] Failed to save message: {exc}")
-        return f"Error: failed to save message to storage: {exc}"
-
-    result_lines.append(f"Saved filename: {Path(saved.path).name}")
     for note in notes:
         result_lines.append(f"Note: {note}")
-
-    if get_transport_mode() == "stdio":
-        result_lines.append(f"\n📎 Saved to: {saved.path}")
-        result_lines.append(
-            "\nThe full message has been written to disk and can be read directly "
-            "from the file path (its content is NOT included above)."
-        )
-    else:
-        result_lines.append(f"\n📎 Download URL: {get_attachment_url(saved.file_id)}")
-        result_lines.append(
-            "\nFetch the full message from the URL above (content is NOT included "
-            "in this response). The file will expire after 1 hour."
-        )
-
-    logger.info(
-        f"[get_gmail_message_content] Exported {size_kb:.1f} KB "
-        f"({extension.lstrip('.')}) to {saved.path}"
+    result_lines.append(
+        "The complete body is delivered as a file and is not repeated in model text."
     )
-    return "\n".join(result_lines)
+    return await deliver_file_bytes(
+        summary="\n".join(result_lines),
+        file_bytes=content_bytes,
+        filename=f"{subject[:80]}{extension}",
+        mime_type=mime_type,
+        stateless=is_stateless_mode(),
+        transport=get_transport_mode(),
+    )
 
 
 def _build_message_get_request(
@@ -896,30 +841,6 @@ def _format_extracted_text_block(text: str) -> List[str]:
     return lines
 
 
-def _build_attachment_tool_result(
-    summary: str,
-    file_bytes: bytes,
-    filename: Optional[str],
-    mime_type: Optional[str],
-    include_file: bool,
-) -> ToolResult:
-    """Return metadata text plus a portable MCP embedded-file resource."""
-    content: list[Any] = [TextContent(type="text", text=summary)]
-    if include_file and file_bytes:
-        safe_filename = sanitize_attachment_filename(filename or "attachment")
-        content.append(
-            EmbeddedResource(
-                type="resource",
-                resource=BlobResourceContents(
-                    uri=f"file:///{quote(safe_filename)}",
-                    mimeType=mime_type or "application/octet-stream",
-                    blob=base64.b64encode(file_bytes).decode("ascii"),
-                ),
-            )
-        )
-    return ToolResult(content=content, structured_content={"result": summary})
-
-
 def _extract_attachments(payload: dict) -> List[Dict[str, Any]]:
     """
     Extract attachment metadata from a Gmail message payload.
@@ -1137,18 +1058,6 @@ async def _download_attachment_bytes(url: str) -> tuple[bytes, httpx.Response]:
         return b"".join(chunks), resp
 
 
-def _build_attachment_error_entry(
-    attachment: Dict[str, Any], exc: Exception
-) -> Dict[str, Any]:
-    """Preserve failed attachment context so message creation can continue."""
-    failed_attachment = dict(attachment)
-    if "url" in failed_attachment:
-        failed_attachment["display_url"] = _redact_url(str(failed_attachment["url"]))
-    failed_attachment["error"] = str(exc)
-    failed_attachment["error_type"] = type(exc).__name__
-    return failed_attachment
-
-
 def _format_resolved_attachment_error(attachment: Dict[str, Any]) -> str:
     """Render a pre-resolved attachment failure for user-facing reporting."""
     label = (
@@ -1211,40 +1120,58 @@ def _try_read_local_attachment(url: str) -> Optional[tuple[bytes, str, Optional[
 
 
 async def _resolve_url_attachments(
-    attachments: Optional[List[Dict[str, Any]]],
+    attachments: Optional[List[EmailAttachmentSource | Dict[str, Any]]],
 ) -> Optional[List[Dict[str, Any]]]:
-    """Pre-resolve any URL-based attachments to raw bytes.
-
-    For each attachment dict that carries a ``url`` key:
-    * If the URL matches the MCP's own ``/attachments/{id}`` pattern the file
-      is read directly from :data:`STORAGE_DIR` (avoids HTTP + SSRF blocks on
-      localhost).
-    * Otherwise the URL is fetched via :func:`ssrf_safe_fetch`.
-
-    The resolved entry replaces ``url`` with ``_resolved_bytes`` (raw
-    ``bytes``) so that :func:`_prepare_gmail_message` can attach it without a
-    redundant base64 round-trip.
-    """
+    """Resolve every requested attachment before any Gmail mutation."""
     if not attachments:
         return attachments
 
     resolved: List[Dict[str, Any]] = []
-    for att in attachments:
-        if "url" not in att:
-            resolved.append(att)
+    total_bytes = 0
+    for raw_attachment in attachments:
+        att = (
+            raw_attachment
+            if isinstance(raw_attachment, EmailAttachmentSource)
+            else EmailAttachmentSource.model_validate(raw_attachment)
+        )
+        content_id = att.content_id
+
+        if not att.url:
+            try:
+                local = await asyncio.to_thread(
+                    resolve_local_file_source,
+                    att,
+                    max_bytes=MAX_EMAIL_ATTACHMENT_BYTES,
+                )
+            except UserInputError:
+                raise
+            except Exception as exc:
+                label = att.filename or att.path or att.workspace_file_id or "attachment"
+                raise UserInputError(
+                    f"Failed to resolve attachment {label}: {exc}"
+                ) from exc
+            entry = {
+                "_resolved_bytes": local.data,
+                "filename": local.filename,
+                "mime_type": local.mime_type,
+            }
+            if content_id:
+                entry["content_id"] = content_id
+            total_bytes += len(local.data)
+            if total_bytes > MAX_EMAIL_ATTACHMENT_BYTES:
+                raise UserInputError(
+                    "The decoded attachment total exceeds Gmail's 25 MiB limit. "
+                    "Upload the file to Drive and send its link instead."
+                )
+            resolved.append(entry)
             continue
 
-        url = att["url"]
-        filename = att.get("filename")
-        mime_type = att.get("mime_type")
+        url = att.url
+        filename = att.filename
+        mime_type = att.mime_type
 
         # Fast path: MCP-local attachment URL.
-        try:
-            local = _try_read_local_attachment(url)
-        except Exception as exc:
-            logger.exception("Failed to read local attachment URL %s", _redact_url(url))
-            resolved.append(_build_attachment_error_entry(att, exc))
-            continue
+        local = _try_read_local_attachment(url)
         if local is not None:
             data, local_filename, local_mime = local
             entry = {
@@ -1252,8 +1179,14 @@ async def _resolve_url_attachments(
                 "filename": filename or local_filename,
                 "mime_type": mime_type or local_mime,
             }
-            if "content_id" in att:
-                entry["content_id"] = att["content_id"]
+            if content_id:
+                entry["content_id"] = content_id
+            total_bytes += len(data)
+            if total_bytes > MAX_EMAIL_ATTACHMENT_BYTES:
+                raise UserInputError(
+                    "The decoded attachment total exceeds Gmail's 25 MiB limit. "
+                    "Upload the file to Drive and send its link instead."
+                )
             resolved.append(entry)
             continue
 
@@ -1261,9 +1194,9 @@ async def _resolve_url_attachments(
         try:
             data, resp = await _download_attachment_bytes(url)
         except Exception as exc:
-            logger.exception("Failed to fetch attachment URL %s", _redact_url(url))
-            resolved.append(_build_attachment_error_entry(att, exc))
-            continue
+            raise UserInputError(
+                f"Failed to resolve attachment {_redact_url(url)}: {exc}"
+            ) from exc
 
         # Infer filename from URL path if not provided.
         if not filename:
@@ -1286,8 +1219,14 @@ async def _resolve_url_attachments(
             "filename": filename,
             "mime_type": mime_type,
         }
-        if "content_id" in att:
-            entry["content_id"] = att["content_id"]
+        if content_id:
+            entry["content_id"] = content_id
+        total_bytes += len(data)
+        if total_bytes > MAX_EMAIL_ATTACHMENT_BYTES:
+            raise UserInputError(
+                "The decoded attachment total exceeds Gmail's 25 MiB limit. "
+                "Upload the file to Drive and send its link instead."
+            )
         resolved.append(entry)
 
     return resolved
@@ -1383,6 +1322,7 @@ def _prepare_gmail_message(
         message.set_content(body)
 
     seen_content_ids: set[str] = set()
+    total_attachment_bytes = 0
 
     for attachment in attachments or []:
         if attachment.get("error"):
@@ -1438,6 +1378,16 @@ def _prepare_gmail_message(
                 .replace("\n", "")
                 .replace("\x00", "")
             ) or "attachment"
+
+            total_attachment_bytes += len(file_data)
+            if (
+                len(file_data) > MAX_EMAIL_ATTACHMENT_BYTES
+                or total_attachment_bytes > MAX_EMAIL_ATTACHMENT_BYTES
+            ):
+                raise ValueError(
+                    "Decoded attachments exceed Gmail's 25 MiB limit; upload the "
+                    "file to Drive and send its link instead."
+                )
 
             main_type, sub_type = (
                 mime_type.split("/", 1)
@@ -1814,6 +1764,7 @@ async def search_gmail_messages(
 
 @server.tool(
     title="Get Gmail Message Content",
+    output_schema=None,
     annotations=ToolAnnotations(
         readOnlyHint=True,
         destructiveHint=False,
@@ -1844,25 +1795,22 @@ async def get_gmail_message_content(
         bool,
         Field(
             description=(
-                "When True, return the COMPLETE untruncated message: saved to local "
-                "storage and referenced by download URL/file path instead of the body "
-                "text, or inlined in the response when the server has no file storage "
-                "(stateless mode). Use for messages large enough to hit the truncation "
+                "When True, return the COMPLETE untruncated message as a portable MCP "
+                "file. Files above the inline limit use a temporary download link when "
+                "storage is available. Use for messages large enough to hit the truncation "
                 "limit, or when byte-exact fidelity is needed (pair with "
                 "body_format='raw' for a .eml export)."
             ),
         ),
     ] = False,
-) -> str:
+) -> ToolResult | str:
     """
     Retrieves the full content (subject, sender, recipients, body) of a specific Gmail message.
 
     Bodies are returned inline and truncated at 20,000 characters. Set full=True to
-    get the complete, untruncated message instead: it is exported to disk and the
-    response carries a short-lived download URL (HTTP transport) or file path (stdio
-    transport) rather than the body, so large messages never stream through the model
-    context. Stateless deployments have no file storage, so there full=True returns the
-    untruncated body inline.
+    get the complete, untruncated message as a portable MCP file. Files above the
+    inline limit use a short-lived download link when storage is available, keeping
+    the body out of model text.
 
     Args:
         message_id (str): The unique ID of the Gmail message to retrieve.
@@ -1871,19 +1819,16 @@ async def get_gmail_message_content(
             "text" (default) returns plaintext (HTML converted to text as fallback).
             "html" returns the raw HTML body as-is without conversion.
             "raw" fetches the full raw MIME message and returns the base64url-decoded content.
-        full (bool): When True, write the untruncated message to local storage and
-            return its URL/path instead of the body. body_format selects the exported
+        full (bool): When True, return the untruncated message as a file instead of
+            model text. body_format selects the exported
             file type: "raw" saves the byte-exact RFC 5322 message as .eml, "html"
             saves the raw HTML body, "text" saves the plaintext body. The "html"/"text"
             exports decode as UTF-8 and drop undecodable bytes, so prefer "raw" when
-            byte-exact fidelity matters. In stateless mode there is no storage to write
-            to, so the untruncated content is returned inline instead.
+            byte-exact fidelity matters.
 
     Returns:
-        str: The message details including subject, sender, date, Message-ID, recipients
-            (To, Cc), and body content — or, when full=True, the saved file's download
-            URL or path in place of the body (the untruncated body itself in stateless
-            mode).
+        ToolResult | str: Inline message details for full=False, or portable file
+            delivery for full=True.
     """
     logger.info(
         f"[get_gmail_message_content] Invoked. Message ID: '{message_id}', "
@@ -2188,9 +2133,9 @@ _ATTACHMENT_METADATA_FIELDS = _attachment_metadata_fields(6)
     title="Get Gmail Attachment Content",
     output_schema=None,
     annotations=ToolAnnotations(
-        readOnlyHint=False,
+        readOnlyHint=True,
         destructiveHint=False,
-        idempotentHint=False,
+        idempotentHint=True,
         openWorldHint=True,
     ),
 )
@@ -2214,8 +2159,8 @@ async def get_gmail_attachment_content(
     EXTRACTED TEXT block, so clients can read document attachments without
     access to the server's filesystem.
 
-    In stdio mode, returns the local file path for direct access.
-    In HTTP mode, returns a temporary download URL (valid for 1 hour).
+    Small files are included as portable MCP resources. Stateful deployments
+    also return a temporary workspace file ID and download URL.
     May re-fetch message metadata to resolve filename and MIME type.
 
     Args:
@@ -2328,105 +2273,27 @@ async def get_gmail_attachment_content(
             f"Could not fetch attachment metadata for {attachment_id}, using defaults"
         )
 
-    # Check if we're in stateless mode (can't save files)
-    from auth.oauth_config import is_stateless_mode
-
-    if is_stateless_mode():
-        result_lines = [
-            "Attachment downloaded successfully!",
-            f"Message ID: {message_id}",
-            f"Filename: {filename or 'attachment'}",
-            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
-            "\n⚠️ Stateless mode: File storage disabled.",
-            "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
-        ]
-        if include_file and attachment_bytes:
-            result_lines.append("\n📎 Attachment included as an MCP file resource.")
-        result_lines.extend(await _extracted_text_lines(mime_type))
-        if return_base64 and base64_data:
-            result_lines.extend(_format_base64_content_block(base64_data))
-        logger.info(
-            f"[get_gmail_attachment_content] Successfully downloaded {size_kb:.1f} KB attachment (stateless mode)"
-        )
-        summary = "\n".join(result_lines)
-        return _build_attachment_tool_result(
-            summary, attachment_bytes, filename, mime_type, include_file
-        )
-
-    # Save attachment to local disk and return file path
-    try:
-        from core.attachment_storage import get_attachment_storage, get_attachment_url
-        from core.config import get_transport_mode
-
-        storage = get_attachment_storage()
-
-        # Save attachment to local disk
-        result = storage.save_attachment(
-            base64_data=base64_data, filename=filename, mime_type=mime_type
-        )
-        saved_filename = Path(result.path).name
-
-        result_lines = [
-            "Attachment downloaded successfully!",
-            f"Message ID: {message_id}",
-            f"Filename: {filename or 'unknown'}",
-            f"Saved filename: {saved_filename}",
-            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
-        ]
-
-        if get_transport_mode() == "stdio":
-            result_lines.append(f"\nServer-local backup: {result.path}")
-            result_lines.append(
-                "\nThis path belongs to the MCP server and may not exist on the client machine."
-            )
-        else:
-            download_url = get_attachment_url(result.file_id)
-            result_lines.append(f"\n📎 Download URL: {download_url}")
-            result_lines.append("\nThe file will expire after 1 hour.")
-
-        result_lines.append(
-            "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch."
-        )
-
-        if include_file and attachment_bytes:
-            result_lines.append("\n📎 Attachment included as an MCP file resource.")
-
-        result_lines.extend(await _extracted_text_lines(mime_type))
-
-        if return_base64 and base64_data:
-            result_lines.extend(_format_base64_content_block(base64_data))
-
-        logger.info(
-            f"[get_gmail_attachment_content] Successfully saved {size_kb:.1f} KB attachment to {result.path}"
-        )
-        summary = "\n".join(result_lines)
-        return _build_attachment_tool_result(
-            summary, attachment_bytes, filename, mime_type, include_file
-        )
-
-    except Exception as e:
-        logger.error(
-            f"[get_gmail_attachment_content] Failed to save attachment: {e}",
-            exc_info=True,
-        )
-        # Fallback to showing base64 preview
-        result_lines = [
-            "Attachment downloaded successfully!",
-            f"Message ID: {message_id}",
-            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
-            "\n⚠️ Failed to save attachment file. Showing preview instead.",
-            "\nBase64-encoded content (first 100 characters shown):",
-            f"{base64_data[:100]}...",
-            f"\nError: {str(e)}",
-            "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
-        ]
-        result_lines.extend(await _extracted_text_lines(mime_type))
-        if return_base64 and base64_data:
-            result_lines.extend(_format_base64_content_block(base64_data))
-        summary = "\n".join(result_lines)
-        return _build_attachment_tool_result(
-            summary, attachment_bytes, filename, mime_type, include_file
-        )
+    size_bytes = len(attachment_bytes) if attachment_bytes else size_bytes
+    size_kb = size_bytes / 1024 if size_bytes else 0
+    result_lines = [
+        "Attachment downloaded successfully!",
+        f"Message ID: {message_id}",
+        f"Filename: {filename or 'attachment'}",
+        f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
+        "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
+    ]
+    result_lines.extend(await _extracted_text_lines(mime_type))
+    if return_base64 and base64_data:
+        result_lines.extend(_format_base64_content_block(base64_data))
+    return await deliver_file_bytes(
+        summary="\n".join(result_lines),
+        file_bytes=attachment_bytes,
+        filename=filename or "attachment",
+        mime_type=mime_type,
+        include_file=include_file,
+        stateless=is_stateless_mode(),
+        transport=get_transport_mode(),
+    )
 
 
 @server.tool(
@@ -2516,9 +2383,9 @@ async def send_gmail_message(
         ),
     ] = None,
     attachments: Annotated[
-        Optional[DictList],
+        Optional[EmailAttachmentList],
         Field(
-            description='Optional list of attachments. Each can have: "url" (fetch from URL — works with MCP attachment URLs from get_drive_file_download_url / get_gmail_attachment_content), OR "path" (file path, auto-encodes), OR "content" (standard base64, not urlsafe) + "filename". Optional "mime_type". Optional "content_id" (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src="cid:<content_id>">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment. Example: [{"url": "https://host/attachments/abc-123", "filename": "report.pdf"}]',
+            description='Optional portable attachments. Each uses exactly one of "workspace_file_id" (preferred server handoff), HTTP(S) "url", standard "base64_content" (legacy "content" is accepted), or server-local "path". Optional "filename", "mime_type", and inline "content_id".',
         ),
     ] = None,
     include_signature: Annotated[
@@ -2805,12 +2672,13 @@ async def send_gmail_message(
     )
 
     requested_attachment_count = len(attachments or [])
-    if requested_attachment_count > 0 and attached_count == 0:
+    if requested_attachment_count > 0 and attached_count != requested_attachment_count:
         details = (
             f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
         )
         raise UserInputError(
-            "No valid attachments were added. Verify each attachment path/content and retry."
+            "Not all requested attachments could be added; the email was not sent. "
+            "Verify each workspace_file_id, URL, base64 value, or server-local path and retry."
             f"{details}"
         )
 
@@ -3034,9 +2902,9 @@ async def draft_gmail_message(
         ),
     ] = None,
     attachments: Annotated[
-        Optional[DictList],
+        Optional[EmailAttachmentList],
         Field(
-            description="Optional list of attachments. Each can have: 'url' (fetch from URL — works with MCP attachment URLs from get_drive_file_download_url / get_gmail_attachment_content), OR 'path' (file path, auto-encodes), OR 'content' (standard base64, not urlsafe) + 'filename'. Optional 'mime_type'. Optional 'content_id' (string) makes the attachment inline-rendered: it lands in a multipart/related part with `Content-ID: <content_id>` and `Content-Disposition: inline`, and the HTML body can reference it via `<img src=\"cid:<content_id>\">` (RFC 2392). Without `content_id` the attachment is a regular multipart/mixed attachment.",
+            description="Optional portable attachments. Each uses exactly one of workspace_file_id (preferred server handoff), HTTP(S) url, standard base64_content (legacy content accepted), or a server-local path. Optional filename, mime_type, and inline content_id.",
         ),
     ] = None,
     include_signature: Annotated[
@@ -3226,12 +3094,13 @@ async def draft_gmail_message(
     )
 
     requested_attachment_count = len(attachments or [])
-    if requested_attachment_count > 0 and attached_count == 0:
+    if requested_attachment_count > 0 and attached_count != requested_attachment_count:
         details = (
             f" Details: {'; '.join(attachment_errors)}" if attachment_errors else ""
         )
         raise UserInputError(
-            "No valid attachments were added. Verify each attachment path/content and retry."
+            "Not all requested attachments could be added; the draft was not changed. "
+            "Verify each workspace_file_id, URL, base64 value, or server-local path and retry."
             f"{details}"
         )
 

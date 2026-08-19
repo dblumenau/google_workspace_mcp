@@ -1,8 +1,8 @@
-"""
-Temporary attachment storage for Gmail attachments.
+"""Temporary server-side storage for portable Workspace files.
 
-Stores attachments to local disk and returns file paths for direct access.
-Files are automatically cleaned up after expiration (default 1 hour).
+Files receive opaque workspace IDs and expire automatically after one hour.
+Server-local paths are backups only; remote MCP clients should use the portable
+resource or download URL returned by the calling tool.
 """
 
 import base64
@@ -97,7 +97,7 @@ class SavedAttachment(NamedTuple):
 
 
 class AttachmentStorage:
-    """Manages temporary storage of email attachments."""
+    """Manages temporary storage for Workspace downloads and handoffs."""
 
     def __init__(self, expiration_seconds: int = DEFAULT_EXPIRATION_SECONDS):
         self.expiration_seconds = expiration_seconds

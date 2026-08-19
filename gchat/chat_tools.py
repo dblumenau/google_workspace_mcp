@@ -4,13 +4,16 @@ Google Chat MCP Tools
 This module provides MCP tools for interacting with Google Chat API.
 """
 
-import base64
 import logging
 import asyncio
 import ssl
+import tempfile
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import httpx
+from fastmcp.exceptions import ToolError
+from fastmcp.tools import ToolResult
 from googleapiclient.errors import HttpError
 
 from mcp.types import ToolAnnotations
@@ -18,7 +21,14 @@ from mcp.types import ToolAnnotations
 # Auth & server utilities
 from auth.service_decorator import require_google_service, require_multiple_services
 from core.server import server
-from core.utils import TransientNetworkError, handle_http_errors
+from auth.oauth_config import is_stateless_mode
+from core.config import get_transport_mode
+from core.file_delivery import deliver_file_path, get_inline_file_max_bytes
+from core.utils import (
+    TransientNetworkError,
+    UserInputError,
+    handle_http_errors,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -601,10 +611,11 @@ async def create_reaction(
 
 @server.tool(
     title="Download Chat Attachment",
+    output_schema=None,
     annotations=ToolAnnotations(
-        readOnlyHint=False,
+        readOnlyHint=True,
         destructiveHint=False,
-        idempotentHint=False,
+        idempotentHint=True,
         openWorldHint=True,
     ),
 )
@@ -615,19 +626,18 @@ async def download_chat_attachment(
     user_google_email: str,
     message_id: str,
     attachment_index: int = 0,
-) -> str:
+    include_file: bool = True,
+) -> ToolResult | str:
     """
-    Downloads an attachment from a Google Chat message and saves it to local disk.
-
-    In stdio mode, returns the local file path for direct access.
-    In HTTP mode, returns a temporary download URL (valid for 1 hour).
+    Downloads a Google Chat attachment as a portable MCP file or temporary link.
 
     Args:
         message_id: The message resource name (e.g. spaces/X/messages/Y).
         attachment_index: Zero-based index of the attachment to download (default 0).
+        include_file: Include the portable MCP file/link content block (default True).
 
     Returns:
-        str: Attachment metadata with either a local file path or download URL.
+        ToolResult | str: Attachment metadata plus portable file delivery.
     """
     logger.info(
         f"[download_chat_attachment] Message: '{message_id}', Index: {attachment_index}"
@@ -643,7 +653,7 @@ async def download_chat_attachment(
         return f"No attachments found on message {message_id}."
 
     if attachment_index < 0 or attachment_index >= len(attachments):
-        return (
+        raise UserInputError(
             f"Invalid attachment_index {attachment_index}. "
             f"Message has {len(attachments)} attachment(s) (0-{len(attachments) - 1})."
         )
@@ -669,74 +679,88 @@ async def download_chat_attachment(
     # and AuthorizedHttp fail in OAuth 2.1 (no refresh_token). The attachment's
     # downloadUri points to chat.google.com which requires browser cookies.
     if not media_resource and not att_name:
-        return f"No resource name available for attachment '{filename}'."
+        raise ToolError(f"No resource name available for attachment '{filename}'.")
 
     # Prefer attachmentDataRef.resourceName for the media endpoint
     resource_name = media_resource or att_name
     download_url = f"https://chat.googleapis.com/v1/media/{resource_name}?alt=media"
 
+    temp_handle = tempfile.NamedTemporaryFile(prefix="workspace-chat-", delete=False)
+    tmp_path = Path(temp_handle.name)
+    temp_handle.close()
+    stateless = is_stateless_mode()
+    limit = get_inline_file_max_bytes()
+    size_bytes = 0
+
     try:
         access_token = service._http.credentials.token
         async with httpx.AsyncClient(follow_redirects=True) as client:
-            resp = await client.get(
+            async with client.stream(
+                "GET",
                 download_url,
                 headers={"Authorization": f"Bearer {access_token}"},
-            )
-            if resp.status_code != 200:
-                body = resp.text[:500]
-                return (
-                    f"Failed to download attachment '{filename}': "
-                    f"HTTP {resp.status_code} from {download_url}\n{body}"
-                )
-            file_bytes = resp.content
-    except Exception as e:
-        return f"Failed to download attachment '{filename}': {e}"
+            ) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread())[:500].decode("utf-8", errors="replace")
+                    raise ToolError(
+                        f"Failed to download attachment '{filename}': HTTP "
+                        f"{resp.status_code} from {download_url}\n{body}"
+                    )
 
-    size_bytes = len(file_bytes)
+                content_length = resp.headers.get("content-length")
+                if stateless and include_file and content_length:
+                    try:
+                        declared_size = int(content_length)
+                    except ValueError:
+                        declared_size = 0
+                    if limit == 0 or declared_size > limit:
+                        raise ToolError(
+                            f"Attachment '{filename}' is {declared_size} bytes, which "
+                            f"exceeds the inline limit of {limit} bytes, and stateless "
+                            "mode cannot stage a download link."
+                        )
+
+                with tmp_path.open("wb") as output:
+                    async for chunk in resp.aiter_bytes():
+                        size_bytes += len(chunk)
+                        if (
+                            stateless
+                            and include_file
+                            and (limit == 0 or size_bytes > limit)
+                        ):
+                            raise ToolError(
+                                f"Attachment '{filename}' exceeded the inline limit "
+                                f"of {limit} bytes while downloading, and stateless "
+                                "mode cannot stage a download link."
+                            )
+                        output.write(chunk)
+    except asyncio.CancelledError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    except ToolError:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    except (httpx.HTTPError, OSError) as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise ToolError(f"Failed to download attachment '{filename}': {exc}") from exc
+    except Exception as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise ToolError(f"Failed to download attachment '{filename}': {exc}") from exc
+
     size_kb = size_bytes / 1024
-
-    # Check if we're in stateless mode (can't save files)
-    from auth.oauth_config import is_stateless_mode
-
-    if is_stateless_mode():
-        b64_preview = base64.urlsafe_b64encode(file_bytes).decode("utf-8")[:100]
-        return "\n".join(
-            [
-                f"Attachment downloaded: {filename} ({content_type})",
-                f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
-                "",
-                "Stateless mode: File storage disabled.",
-                f"Base64 preview: {b64_preview}...",
-            ]
-        )
-
-    # Save to local disk
-    from core.attachment_storage import get_attachment_storage, get_attachment_url
-    from core.config import get_transport_mode
-
-    storage = get_attachment_storage()
-    b64_data = base64.urlsafe_b64encode(file_bytes).decode("utf-8")
-    result = storage.save_attachment(
-        base64_data=b64_data, filename=filename, mime_type=content_type
+    summary = "\n".join(
+        [
+            f"Attachment downloaded: {filename}",
+            f"Type: {content_type}",
+            f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
+        ]
     )
-
-    result_lines = [
-        f"Attachment downloaded: {filename}",
-        f"Type: {content_type}",
-        f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
-    ]
-
-    if get_transport_mode() == "stdio":
-        result_lines.append(f"\nSaved to: {result.path}")
-        result_lines.append(
-            "\nThe file has been saved to disk and can be accessed directly via the file path."
-        )
-    else:
-        download_url = get_attachment_url(result.file_id)
-        result_lines.append(f"\nDownload URL: {download_url}")
-        result_lines.append("\nThe file will expire after 1 hour.")
-
-    logger.info(
-        f"[download_chat_attachment] Saved {size_kb:.1f} KB attachment to {result.path}"
+    return await deliver_file_path(
+        summary=summary,
+        file_path=tmp_path,
+        filename=filename,
+        mime_type=content_type,
+        include_file=include_file,
+        stateless=stateless,
+        transport=get_transport_mode(),
     )
-    return "\n".join(result_lines)

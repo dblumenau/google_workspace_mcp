@@ -634,11 +634,15 @@ async def _resolve_import_media(
     source_format: Optional[str],
     format_map: Optional[Dict[str, str]] = None,
     passthrough_mime_type: Optional[str] = None,
+    file_bytes: Optional[bytes] = None,
+    source_filename: Optional[str] = None,
+    source_mime_type_hint: Optional[str] = None,
 ) -> Tuple[MediaIoBaseUpload, str, Optional[BinaryIO]]:
     """
     Resolve a content source into an upload ``MediaIoBaseUpload`` and source MIME type.
 
-    Exactly one of ``content``, ``file_path``, or ``file_url`` must be provided.
+    Exactly one of ``content``, ``file_path``, ``file_url``, or internal
+    ``file_bytes`` must be provided.
     The source bytes are uploaded with their *source* MIME type so the Drive API can
     convert them into the destination Google Apps format. ``format_map`` is the
     extension → source MIME allowlist used for detection and validation.
@@ -650,13 +654,17 @@ async def _resolve_import_media(
     Returns ``(media, source_mime_type, closeable)``; when the source is a remote URL,
     ``closeable`` is the download stream the caller must close after upload (else None).
     """
-    source_count = sum(1 for x in (content, file_path, file_url) if x is not None)
+    source_count = sum(
+        1 for x in (content, file_path, file_url, file_bytes) if x is not None
+    )
     if source_count == 0:
         raise ValueError(
-            "You must provide one of: 'content', 'file_path', or 'file_url'."
+            "You must provide one of: 'content', 'file_path', 'file_url', or file bytes."
         )
     if source_count > 1:
-        raise ValueError("Provide only one of: 'content', 'file_path', or 'file_url'.")
+        raise ValueError(
+            "Provide only one of: 'content', 'file_path', 'file_url', or file bytes."
+        )
 
     # Determine source MIME type from the explicit hint or auto-detection.
     if passthrough_mime_type:
@@ -669,9 +677,13 @@ async def _resolve_import_media(
                 f"Supported: {', '.join(ext.lstrip('.') for ext in format_map.keys())}"
             )
         source_mime_type = format_map[format_key]
+    elif source_mime_type_hint and (
+        format_map is None or source_mime_type_hint in format_map.values()
+    ):
+        source_mime_type = source_mime_type_hint
     else:
-        detection_name = file_path or file_name
-        if file_url is not None:
+        detection_name = file_path or source_filename or file_name
+        if file_url is not None and not source_filename:
             detection_name = urlparse(file_url).path or file_url
         source_mime_type = _detect_source_format(detection_name, content, format_map)
 
@@ -680,7 +692,10 @@ async def _resolve_import_media(
     file_data: bytes
     remote_file_data: Optional[BinaryIO] = None
 
-    if content is not None:
+    if file_bytes is not None:
+        file_data = file_bytes
+        logger.info(f"[{tool_name}] Using portable file bytes: {len(file_data)} bytes")
+    elif content is not None:
         if not _is_text_like_mime_type(source_mime_type):
             raise ValueError(
                 f"[{tool_name}] 'content' is only valid for text-based source formats, "
@@ -715,7 +730,11 @@ async def _resolve_import_media(
         logger.info(f"[{tool_name}] Read local file: {len(file_data)} bytes")
 
         # Re-detect from the real file extension when no explicit hint was given.
-        if not source_format and not passthrough_mime_type:
+        if (
+            not source_format
+            and not passthrough_mime_type
+            and not source_mime_type_hint
+        ):
             source_mime_type = _detect_source_format(actual_path, None, format_map)
 
     else:  # file_url is not None
@@ -732,7 +751,7 @@ async def _resolve_import_media(
                 source_mime_type = ct_base
             else:
                 source_mime_type = _detect_source_format(
-                    parsed_url.path or file_url, None, format_map
+                    source_filename or parsed_url.path or file_url, None, format_map
                 )
 
     # Enforce the allowlist on the final resolved MIME type so auto-detection can't

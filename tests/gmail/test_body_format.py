@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock
 
 import pytest
+from fastmcp.exceptions import ToolError
 
 import gmail.gmail_tools as gmail_tools
 from core.utils import UserInputError
@@ -600,10 +601,21 @@ def stdio_storage(monkeypatch, tmp_path):
     return tmp_path
 
 
-def _saved_path(result: str) -> str:
+def _result_text(result) -> str:
+    if isinstance(result, str):
+        return result
+    return next(item.text for item in result.content if item.type == "text")
+
+
+def _result_file_bytes(result) -> bytes:
+    resource = next(item.resource for item in result.content if item.type == "resource")
+    return base64.b64decode(resource.blob)
+
+
+def _saved_path(result) -> str:
     """Pull the on-disk path out of a stdio-mode full-export response."""
-    marker = "📎 Saved to: "
-    line = next(ln for ln in result.splitlines() if marker in ln)
+    marker = "Server-local backup: "
+    line = next(ln for ln in _result_text(result).splitlines() if marker in ln)
     return line.split(marker, 1)[1].strip()
 
 
@@ -632,11 +644,13 @@ async def test_full_export_raw_saves_complete_eml(stdio_storage):
     )
 
     # Body content must NOT be inlined in the response.
-    assert "Complete raw MIME body" not in result
-    assert "--- RAW MIME ---" not in result
-    assert "--- FULL MESSAGE EXPORT ---" in result
-    assert "Format: eml" in result
-    assert "Subject: Example subject" in result
+    text = _result_text(result)
+    assert "Complete raw MIME body" not in text
+    assert "--- RAW MIME ---" not in text
+    assert "--- FULL MESSAGE EXPORT ---" in text
+    assert "Format: eml" in text
+    assert "Subject: Example subject" in text
+    assert _result_file_bytes(result).decode() == raw_mime
 
     # The saved file must hold the complete, decoded message.
     with open(_saved_path(result), "rb") as fh:
@@ -661,8 +675,9 @@ async def test_full_export_text_uses_plaintext(stdio_storage):
         full=True,
     )
 
-    assert "Plain body" not in result
-    assert "Format: txt" in result
+    assert "Plain body" not in _result_text(result)
+    assert "Format: txt" in _result_text(result)
+    assert _result_file_bytes(result).decode() == "Plain body"
     with open(_saved_path(result), "rb") as fh:
         assert fh.read().decode() == "Plain body"
 
@@ -686,7 +701,8 @@ async def test_full_export_html_saves_raw_html(stdio_storage):
         full=True,
     )
 
-    assert "Rich HTML" not in result
+    assert "Rich HTML" not in _result_text(result)
+    assert _result_file_bytes(result).decode() == "<p><b>Rich HTML</b></p>"
     with open(_saved_path(result), "rb") as fh:
         assert fh.read().decode() == "<p><b>Rich HTML</b></p>"
 
@@ -745,7 +761,8 @@ async def test_full_export_does_not_truncate(stdio_storage):
         full=True,
     )
 
-    assert "[Content truncated...]" not in result
+    assert "[Content truncated...]" not in _result_text(result)
+    assert _result_file_bytes(result).decode() == long_html
     with open(_saved_path(result), "rb") as fh:
         saved = fh.read().decode()
     assert saved == long_html
@@ -761,8 +778,7 @@ async def test_full_export_http_returns_url(monkeypatch, tmp_path):
     monkeypatch.setattr(gmail_tools, "get_transport_mode", lambda: "streamable-http")
     monkeypatch.setattr(gmail_tools, "is_stateless_mode", lambda: False)
     monkeypatch.setattr(
-        gmail_tools,
-        "get_attachment_url",
+        "core.file_delivery.get_attachment_url",
         lambda file_id: f"https://example.test/attachments/{file_id}",
     )
 
@@ -781,13 +797,13 @@ async def test_full_export_http_returns_url(monkeypatch, tmp_path):
         full=True,
     )
 
-    assert "https://example.test/attachments/" in result
-    assert "raw body" not in result
+    assert "https://example.test/attachments/" in _result_text(result)
+    assert "raw body" not in _result_text(result)
 
 
 @pytest.mark.asyncio
-async def test_full_export_inlines_content_in_stateless_mode(monkeypatch):
-    """Without file storage, full=True still delivers the complete message — inline."""
+async def test_full_export_embeds_content_in_stateless_mode(monkeypatch):
+    """Without file storage, full=True delivers the exact portable file."""
     monkeypatch.setattr(gmail_tools, "is_stateless_mode", lambda: True)
     raw_mime = "From: sender@example.com\r\n\r\nComplete raw MIME body!"
     service = _build_service(
@@ -805,13 +821,14 @@ async def test_full_export_inlines_content_in_stateless_mode(monkeypatch):
         full=True,
     )
 
-    assert "--- BODY (COMPLETE, NOT TRUNCATED) ---" in result
-    assert raw_mime in result
-    assert "Format: eml" in result
-    assert "Subject: Example subject" in result
+    text = _result_text(result)
+    assert raw_mime not in text
+    assert _result_file_bytes(result).decode() == raw_mime
+    assert "Format: eml" in text
+    assert "Subject: Example subject" in text
     # No file was written, so nothing to point at.
-    assert "Saved to:" not in result
-    assert "Download URL:" not in result
+    assert "Server-local backup:" not in text
+    assert "Download URL:" not in text
 
 
 @pytest.mark.asyncio
@@ -833,8 +850,30 @@ async def test_full_inline_in_stateless_mode_does_not_truncate(monkeypatch):
         full=True,
     )
 
-    assert long_html in result
-    assert "[Content truncated...]" not in result
+    assert long_html not in _result_text(result)
+    assert _result_file_bytes(result).decode() == long_html
+    assert "[Content truncated...]" not in _result_text(result)
+
+
+@pytest.mark.asyncio
+async def test_full_export_over_inline_limit_errors_in_stateless_mode(monkeypatch):
+    monkeypatch.setattr(gmail_tools, "is_stateless_mode", lambda: True)
+    monkeypatch.setenv("WORKSPACE_MCP_INLINE_FILE_MAX_BYTES", "4")
+    service = _build_service(
+        message_responses={
+            ("msg-large", "metadata"): _metadata_response("msg-large"),
+            ("msg-large", "raw"): {"raw": _encode("five!")},
+        }
+    )
+
+    with pytest.raises(ToolError, match="stateless mode cannot stage"):
+        await _unwrap(get_gmail_message_content)(
+            service=service,
+            message_id="msg-large",
+            user_google_email="user@example.com",
+            body_format="raw",
+            full=True,
+        )
 
 
 @pytest.mark.asyncio
@@ -939,8 +978,8 @@ async def test_full_export_html_falls_back_to_text_and_labels_it(stdio_storage):
         full=True,
     )
 
-    assert "No HTML body present" in result
-    assert "Format: txt" in result
+    assert "No HTML body present" in _result_text(result)
+    assert "Format: txt" in _result_text(result)
     saved_path = _saved_path(result)
     assert saved_path.endswith(".txt")
     with open(saved_path, "rb") as fh:

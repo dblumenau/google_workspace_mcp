@@ -36,7 +36,11 @@ async def test_serve_attachment_uses_path_param_file_id(monkeypatch, tmp_path):
     class DummyStorage:
         def get_attachment_metadata(self, file_id):
             captured["file_id"] = file_id
-            return {"filename": "sample.pdf", "mime_type": "application/pdf"}
+            return {
+                "filename": "sample_uuid.pdf",
+                "original_filename": "Quarterly Report.pdf",
+                "mime_type": "application/pdf",
+            }
 
         def get_attachment_path(self, _file_id):
             return file_path
@@ -50,6 +54,9 @@ async def test_serve_attachment_uses_path_param_file_id(monkeypatch, tmp_path):
     assert captured["file_id"] == "abc123"
     assert isinstance(response, FileResponse)
     assert response.status_code == 200
+    assert response.headers["cache-control"] == "private, no-store"
+    assert response.headers["x-content-type-options"] == "nosniff"
+    assert "Quarterly%20Report.pdf" in response.headers["content-disposition"]
 
 
 @pytest.mark.asyncio

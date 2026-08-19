@@ -796,7 +796,7 @@ async def health_check(request: Request):
     )
 
 
-@server.custom_route("/attachments/{file_id}", methods=["GET"])
+@server.custom_route("/attachments/{file_id}", methods=["GET", "HEAD"])
 async def serve_attachment(request: Request):
     """Serve a stored attachment file."""
     from core.attachment_storage import get_attachment_storage
@@ -816,8 +816,12 @@ async def serve_attachment(request: Request):
 
     return FileResponse(
         path=str(file_path),
-        filename=metadata["filename"],
+        filename=metadata.get("original_filename") or metadata["filename"],
         media_type=metadata["mime_type"],
+        headers={
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
     )
 
 

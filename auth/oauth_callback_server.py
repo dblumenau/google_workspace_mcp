@@ -119,7 +119,7 @@ class MinimalOAuthServer:
         """Setup the attachment serving route."""
         from core.attachment_storage import get_attachment_storage
 
-        @self.app.get("/attachments/{file_id}")
+        @self.app.api_route("/attachments/{file_id}", methods=["GET", "HEAD"])
         async def serve_attachment(file_id: str, request: Request):
             """Serve a stored attachment file."""
             storage = get_attachment_storage()
@@ -138,8 +138,12 @@ class MinimalOAuthServer:
 
             return FileResponse(
                 path=str(file_path),
-                filename=metadata["filename"],
+                filename=metadata.get("original_filename") or metadata["filename"],
                 media_type=metadata["mime_type"],
+                headers={
+                    "Cache-Control": "private, no-store",
+                    "X-Content-Type-Options": "nosniff",
+                },
             )
 
     def is_actually_running(self) -> bool:

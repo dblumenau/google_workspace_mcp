@@ -15,6 +15,8 @@ from threading import Event
 from unittest.mock import Mock, patch
 
 import pytest
+from fastmcp.tools import ToolResult
+from mcp.types import BlobResourceContents, EmbeddedResource
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse
 
@@ -71,8 +73,12 @@ def storage(tmp_path, monkeypatch):
     monkeypatch.setattr(attachment_storage, "STORAGE_DIR", storage_dir)
     instance = AttachmentStorage()
     monkeypatch.setattr(attachment_storage, "get_attachment_storage", lambda: instance)
-    monkeypatch.setattr("gdrive.drive_tools.get_attachment_storage", lambda: instance)
+    monkeypatch.setattr("core.file_delivery.get_attachment_storage", lambda: instance)
     return instance
+
+
+def _result_text(result: ToolResult) -> str:
+    return next(item.text for item in result.content if item.type == "text")
 
 
 @pytest.fixture
@@ -138,9 +144,16 @@ async def test_download_url_moves_payload_into_storage(mock_resolve, storage):
             file_id="file123",
         )
 
-    saved = Path(result.split("📎 Saved to: ")[1].splitlines()[0].strip())
+    assert isinstance(result, ToolResult)
+    saved = storage.get_attachment_path(result.structured_content["workspace_file_id"])
+    assert saved is not None
     assert saved.read_bytes() == b"video-bytes"
-    assert "11 bytes" in result
+    assert "11 bytes" in _result_text(result)
+    resource = next(
+        item for item in result.content if isinstance(item, EmbeddedResource)
+    )
+    assert isinstance(resource.resource, BlobResourceContents)
+    assert resource.resource.mimeType == "video/mp4"
     # The temp file was moved, not copied, so nothing is left behind.
     assert not Path(_FakeDownloader.handles[0].name).exists()
 
@@ -203,7 +216,7 @@ async def test_worker_save_survives_concurrent_attachment_route_sweep(
 
     assert isinstance(racing_response, JSONResponse)
     assert racing_response.status_code == 404
-    assert "Saved to:" in result
+    assert "Server-local backup:" in _result_text(result)
     assert not source.exists()
 
     saved_path = Path(storage._metadata[attachment_id]["file_path"])
@@ -214,7 +227,7 @@ async def test_worker_save_survives_concurrent_attachment_route_sweep(
 
 
 @pytest.mark.asyncio
-async def test_download_url_stateless_mode_previews_and_cleans_up(mock_resolve):
+async def test_download_url_stateless_mode_embeds_and_cleans_up(mock_resolve):
     mock_service = Mock()
     mock_service.files().get_media.return_value = "req"
 
@@ -228,6 +241,11 @@ async def test_download_url_stateless_mode_previews_and_cleans_up(mock_resolve):
             file_id="file123",
         )
 
-    assert "Stateless mode" in result
-    assert "500 bytes" in result
+    assert isinstance(result, ToolResult)
+    assert "500 bytes" in _result_text(result)
+    resource = next(
+        item for item in result.content if isinstance(item, EmbeddedResource)
+    )
+    assert isinstance(resource.resource, BlobResourceContents)
+    assert len(resource.resource.blob) > 500
     assert not Path(_FakeDownloader.handles[0].name).exists()

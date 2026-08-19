@@ -171,6 +171,48 @@ async def test_create_drive_file_rejects_empty_file_url():
     mock_service.files.return_value.create.return_value.execute.assert_not_called()
 
 
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock)
+async def test_create_drive_file_accepts_portable_base64_source(mock_resolve_folder):
+    payload = b"portable-pdf-bytes"
+    mock_resolve_folder.return_value = "folder123"
+    mock_service = Mock()
+    mock_service.files().create().execute.return_value = {
+        "id": "pdf123",
+        "name": "destination.pdf",
+        "webViewLink": "https://drive.google.com/file/d/pdf123",
+    }
+
+    await _unwrap(create_drive_file)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        file_name="destination.pdf",
+        file_source={
+            "base64_content": base64.b64encode(payload).decode(),
+            "filename": "source.pdf",
+            "mime_type": "application/pdf",
+        },
+    )
+
+    media = mock_service.files.return_value.create.call_args.kwargs["media_body"]
+    assert media.mimetype() == "application/pdf"
+    assert media.getbytes(0, len(payload)) == payload
+
+
+@pytest.mark.asyncio
+async def test_create_drive_file_rejects_mixed_portable_and_legacy_sources():
+    mock_service = Mock()
+    with pytest.raises(ValueError, match="file_source cannot be combined"):
+        await _unwrap(create_drive_file)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            file_name="note.txt",
+            content="legacy",
+            file_source={"base64_content": "bmV3", "filename": "note.txt"},
+        )
+    mock_service.files.return_value.create.return_value.execute.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # get_drive_file_permissions — owners
 # ---------------------------------------------------------------------------
@@ -1959,6 +2001,64 @@ async def test_import_to_google_doc_accepts_markdown_content(mock_resolve_folder
     assert "Successfully imported" in result
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool", "source_name", "source_mime", "target_mime"),
+    [
+        (
+            import_to_google_doc,
+            "report.docx",
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            "application/vnd.google-apps.document",
+        ),
+        (
+            import_to_google_slides,
+            "deck.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            "application/vnd.google-apps.presentation",
+        ),
+        (
+            import_to_google_sheets,
+            "budget.xlsx",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            "application/vnd.google-apps.spreadsheet",
+        ),
+    ],
+)
+async def test_import_tools_accept_portable_binary_sources(
+    tool, source_name, source_mime, target_mime
+):
+    payload = b"PK\x03\x04portable-office-bytes"
+    mock_service = Mock()
+    mock_service.files().create().execute.return_value = {
+        "id": "created123",
+        "name": "Imported",
+        "mimeType": target_mime,
+        "webViewLink": "https://drive.google.com/file/created123",
+    }
+
+    with patch(
+        "gdrive.drive_tools.resolve_folder_id", new_callable=AsyncMock
+    ) as mock_resolve_folder:
+        mock_resolve_folder.return_value = "root"
+        await _unwrap(tool)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            file_name="Imported",
+            file_source={
+                "base64_content": base64.b64encode(payload).decode(),
+                "filename": source_name,
+                "mime_type": source_mime,
+            },
+        )
+
+    create_kwargs = mock_service.files.return_value.create.call_args.kwargs
+    assert create_kwargs["body"]["mimeType"] == target_mime
+    media = create_kwargs["media_body"]
+    assert media.mimetype() == source_mime
+    assert media.getbytes(0, len(payload)) == payload
+
+
 # ---------------------------------------------------------------------------
 # update_drive_file — in-place content replacement with conversion
 # ---------------------------------------------------------------------------
@@ -1997,6 +2097,56 @@ async def test_update_drive_file_replaces_content_with_conversion(mock_resolve_i
     )
     assert execute_kwargs["num_retries"] == 3
     assert "Replaced content" in result
+
+
+@pytest.mark.asyncio
+@patch("gdrive.drive_tools.resolve_drive_item", new_callable=AsyncMock)
+async def test_update_drive_file_replaces_with_portable_binary_source(
+    mock_resolve_item,
+):
+    payload = b"PK\x03\x04new-docx"
+    docx_mime = (
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    )
+    mock_resolve_item.return_value = (
+        "doc123",
+        {"name": "Living Doc", "mimeType": "application/vnd.google-apps.document"},
+    )
+    mock_service = Mock()
+    mock_service.files().update().execute.return_value = {
+        "id": "doc123",
+        "name": "Living Doc",
+        "mimeType": "application/vnd.google-apps.document",
+    }
+
+    await _unwrap(update_drive_file)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        file_id="doc123",
+        file_source={
+            "base64_content": base64.b64encode(payload).decode(),
+            "filename": "replacement.docx",
+            "mime_type": docx_mime,
+        },
+    )
+
+    media = mock_service.files.return_value.update.call_args.kwargs["media_body"]
+    assert media.mimetype() == docx_mime
+    assert media.getbytes(0, len(payload)) == payload
+
+
+@pytest.mark.asyncio
+async def test_update_drive_file_rejects_portable_source_for_append():
+    mock_service = Mock()
+    with pytest.raises(ValueError, match="only supported with mode='replace'"):
+        await _unwrap(update_drive_file)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            file_id="file123",
+            mode="append",
+            file_source={"base64_content": "YQ==", "filename": "a.txt"},
+        )
+    mock_service.files.return_value.update.return_value.execute.assert_not_called()
 
 
 @pytest.mark.asyncio
