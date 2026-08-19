@@ -5,6 +5,8 @@ localhost download URLs or local file paths.
 """
 
 import base64
+import io
+import zipfile
 from typing import Any, Callable
 from unittest.mock import Mock
 
@@ -13,9 +15,28 @@ import pytest
 from core.server import server
 from core.tool_registry import get_tool_components
 from gmail.gmail_tools import (
+    EXTRACTED_TEXT_CHAR_LIMIT,
     _format_base64_content_block,
+    _format_extracted_text_block,
     get_gmail_attachment_content,
 )
+
+
+def _build_docx_bytes(text: str) -> bytes:
+    """Build a minimal but valid .docx containing ``text``."""
+    document_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+        f"<w:body><w:p><w:r><w:t>{text}</w:t></w:r></w:p></w:body></w:document>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr(
+            "[Content_Types].xml",
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"/>',
+        )
+        zf.writestr("word/document.xml", document_xml)
+    return buf.getvalue()
 
 
 def _unwrap(tool: Any) -> Callable[..., Any]:
@@ -227,3 +248,121 @@ async def test_return_base64_preserves_file_save_behavior(isolated_attachment_en
     assert "Download URL" in result
     # ...and includes the base64 block.
     assert "📦 Base64 content" in result
+
+
+@pytest.mark.asyncio
+async def test_docx_attachment_includes_extracted_text(isolated_attachment_env):
+    """A .docx attachment should get its text extracted server-side by default."""
+    payload = _build_docx_bytes("Sveiki, this is the archive certificate")
+    mock_service = _build_mock_service(
+        payload,
+        filename="certificate.docx",
+        mime_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    )
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=mock_service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+    )
+
+    assert "--- EXTRACTED TEXT ---" in result
+    assert "Sveiki, this is the archive certificate" in result
+
+
+@pytest.mark.asyncio
+async def test_docx_extraction_sniffs_zip_when_mime_is_generic(
+    isolated_attachment_env,
+):
+    """Extraction must survive missing/generic MIME metadata via zip sniffing."""
+    payload = _build_docx_bytes("Sniffed content")
+    mock_service = _build_mock_service(
+        payload, filename="unknown.bin", mime_type="application/octet-stream"
+    )
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=mock_service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+    )
+
+    assert "--- EXTRACTED TEXT ---" in result
+    assert "Sniffed content" in result
+
+
+@pytest.mark.asyncio
+async def test_pdf_attachment_routes_to_pdf_extractor(
+    isolated_attachment_env, monkeypatch
+):
+    """%PDF payloads should be routed to the PDF text extractor."""
+    import gmail.gmail_tools as gmail_tools_module
+
+    monkeypatch.setattr(
+        gmail_tools_module, "extract_pdf_text", lambda _b: "Extracted PDF text"
+    )
+    payload = b"%PDF-1.4 fake pdf bytes \x00\x01"
+    mock_service = _build_mock_service(
+        payload, filename="doc.pdf", mime_type="application/pdf"
+    )
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=mock_service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+    )
+
+    assert "--- EXTRACTED TEXT ---" in result
+    assert "Extracted PDF text" in result
+
+
+@pytest.mark.asyncio
+async def test_utf8_text_attachment_is_included_inline(isolated_attachment_env):
+    """Plain UTF-8 attachments (txt/csv/json) should be readable inline."""
+    payload = "name,age\nDavid,42\n".encode("utf-8")
+    mock_service = _build_mock_service(
+        payload, filename="data.csv", mime_type="text/csv"
+    )
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=mock_service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+    )
+
+    assert "--- EXTRACTED TEXT ---" in result
+    assert "name,age" in result
+
+
+@pytest.mark.asyncio
+async def test_binary_attachment_has_no_extracted_text_block(
+    isolated_attachment_env,
+):
+    """Non-text binary (e.g. PNG) must not produce an extracted-text block."""
+    payload = b"\x89PNG\r\n\x1a\n" + bytes(range(256))
+    mock_service = _build_mock_service(
+        payload, filename="image.png", mime_type="image/png"
+    )
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=mock_service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+    )
+
+    assert "--- EXTRACTED TEXT ---" not in result
+
+
+def test_format_extracted_text_block_truncates_long_text():
+    """Huge documents must be capped so they can't flood the client context."""
+    text = "x" * (EXTRACTED_TEXT_CHAR_LIMIT + 500)
+
+    lines = _format_extracted_text_block(text)
+
+    assert lines[0] == "\n--- EXTRACTED TEXT ---"
+    assert len(lines[1]) == EXTRACTED_TEXT_CHAR_LIMIT
+    assert "truncated" in lines[2]

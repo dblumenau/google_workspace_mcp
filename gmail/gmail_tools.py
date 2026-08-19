@@ -8,7 +8,9 @@ import logging
 import asyncio
 import base64
 import binascii
+import io
 import re
+import zipfile
 import ssl
 import mimetypes
 import html
@@ -43,6 +45,9 @@ from core.config import (
 from core.http_utils import ssrf_safe_stream
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
+    IMAGE_MIME_TYPES,
+    extract_office_xml_text,
+    extract_pdf_text,
     handle_http_errors,
     validate_file_path,
     UserInputError,
@@ -793,6 +798,76 @@ def _format_base64_content_block(urlsafe_b64_data: str) -> List[str]:
             f"to standard base64: {e}"
         )
         return [f"\n⚠️ Could not include base64 content: {e}"]
+
+
+OFFICE_XML_MIME_TYPES = {
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+}
+
+EXTRACTED_TEXT_CHAR_LIMIT = 50_000
+
+
+def _resolve_extraction_mime_type(
+    file_bytes: bytes, mime_type: Optional[str]
+) -> Optional[str]:
+    """
+    Resolve the MIME type to use for text extraction, sniffing the file bytes
+    when Gmail metadata is missing or generic (e.g. application/octet-stream).
+
+    Metadata resolution for attachments is best-effort — the sniff keeps
+    extraction working when it fails.
+    """
+    if mime_type in OFFICE_XML_MIME_TYPES or mime_type == "application/pdf":
+        return mime_type
+    if file_bytes.startswith(b"%PDF"):
+        return "application/pdf"
+    if file_bytes.startswith(b"PK\x03\x04"):
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes)) as zf:
+                names = zf.namelist()
+            if any(n.startswith("word/") for n in names):
+                return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            if any(n.startswith("xl/") for n in names):
+                return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            if any(n.startswith("ppt/") for n in names):
+                return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+        except (zipfile.BadZipFile, OSError):
+            pass
+    return mime_type
+
+
+def _extract_attachment_text(
+    file_bytes: bytes, mime_type: Optional[str]
+) -> Optional[str]:
+    """
+    Extract readable text from attachment bytes (Office XML, PDF, or any
+    UTF-8-decodable content). Returns None when nothing extractable.
+    """
+    resolved = _resolve_extraction_mime_type(file_bytes, mime_type)
+    if resolved in OFFICE_XML_MIME_TYPES:
+        return extract_office_xml_text(file_bytes, resolved)
+    if resolved == "application/pdf":
+        return extract_pdf_text(file_bytes)
+    if resolved in IMAGE_MIME_TYPES:
+        return None
+    try:
+        return file_bytes.decode("utf-8").strip() or None
+    except UnicodeDecodeError:
+        return None
+
+
+def _format_extracted_text_block(text: str) -> List[str]:
+    """Format extracted attachment text as labeled result lines, capped so a
+    huge document can't flood the client's context."""
+    lines = ["\n--- EXTRACTED TEXT ---", text[:EXTRACTED_TEXT_CHAR_LIMIT]]
+    if len(text) > EXTRACTED_TEXT_CHAR_LIMIT:
+        lines.append(
+            f"\n[Extracted text truncated to {EXTRACTED_TEXT_CHAR_LIMIT} of "
+            f"{len(text)} characters. Download the file for the full content.]"
+        )
+    return lines
 
 
 def _extract_attachments(payload: dict) -> List[Dict[str, Any]]:
@@ -1940,7 +2015,11 @@ async def get_gmail_attachment_content(
     return_base64: bool = False,
 ) -> str:
     """
-    Downloads an email attachment and saves it to local disk.
+    Downloads an email attachment, saves it to local disk, and extracts
+    readable text server-side (Office XML documents via std-lib zip parsing,
+    PDFs via pypdf, plain-text/UTF-8 content directly) into an
+    EXTRACTED TEXT block, so clients can read document attachments without
+    access to the server's filesystem.
 
     In stdio mode, returns the local file path for direct access.
     In HTTP mode, returns a temporary download URL (valid for 1 hour).
@@ -1962,8 +2041,9 @@ async def get_gmail_attachment_content(
 
     Returns:
         str: Attachment metadata with either a local file path or download URL,
-            optionally followed by a base64 content block when
-            ``return_base64=True``.
+            an EXTRACTED TEXT block when the attachment contains extractable
+            text (capped at 50,000 characters), and optionally a base64
+            content block when ``return_base64=True``.
     """
     logger.info(
         f"[get_gmail_attachment_content] Invoked. Message ID: '{message_id}', Email: '{user_google_email}'"
@@ -1994,6 +2074,20 @@ async def get_gmail_attachment_content(
     size_kb = size_bytes / 1024 if size_bytes else 0
     base64_data = attachment.get("data", "")
 
+    # Gmail returns URL-safe base64; decode once for text extraction.
+    try:
+        attachment_bytes = base64.urlsafe_b64decode(base64_data)
+    except (binascii.Error, ValueError):
+        attachment_bytes = b""
+
+    async def _extracted_text_lines(mime_type: Optional[str]) -> List[str]:
+        if not attachment_bytes:
+            return []
+        text = await asyncio.to_thread(
+            _extract_attachment_text, attachment_bytes, mime_type
+        )
+        return _format_extracted_text_block(text) if text else []
+
     # Check if we're in stateless mode (can't save files)
     from auth.oauth_config import is_stateless_mode
 
@@ -2007,6 +2101,7 @@ async def get_gmail_attachment_content(
             f"{base64_data[:100]}...",
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
         ]
+        result_lines.extend(await _extracted_text_lines(None))
         if return_base64 and base64_data:
             result_lines.extend(_format_base64_content_block(base64_data))
         logger.info(
@@ -2098,6 +2193,8 @@ async def get_gmail_attachment_content(
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch."
         )
 
+        result_lines.extend(await _extracted_text_lines(mime_type))
+
         if return_base64 and base64_data:
             result_lines.extend(_format_base64_content_block(base64_data))
 
@@ -2122,6 +2219,7 @@ async def get_gmail_attachment_content(
             f"\nError: {str(e)}",
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
         ]
+        result_lines.extend(await _extracted_text_lines(None))
         if return_base64 and base64_data:
             result_lines.extend(_format_base64_content_block(base64_data))
         return "\n".join(result_lines)
