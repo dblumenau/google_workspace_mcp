@@ -37,6 +37,8 @@ def _load_startup_dependencies():
     from core.tool_tier_loader import resolve_tools_from_tier
     from core.tool_registry import (
         set_enabled_tools as set_enabled_tool_names,
+        resolve_disabled_tools,
+        set_disabled_tools,
         wrap_server_tool_method,
         filter_server_tools,
     )
@@ -57,6 +59,8 @@ def _load_startup_dependencies():
         configure_server_for_http,
         resolve_tools_from_tier,
         set_enabled_tool_names,
+        resolve_disabled_tools,
+        set_disabled_tools,
         wrap_server_tool_method,
         filter_server_tools,
     )
@@ -78,6 +82,8 @@ def _load_startup_dependencies():
     configure_server_for_http,
     resolve_tools_from_tier,
     set_enabled_tool_names,
+    resolve_disabled_tools,
+    set_disabled_tools,
     wrap_server_tool_method,
     filter_server_tools,
 ) = _load_startup_dependencies()
@@ -311,6 +317,14 @@ def _flag_field(name: str, *, warn_when_true: bool = False) -> tuple[str, str, s
     return name, value, "warn" if warn_when_true else "on"
 
 
+def _disabled_tools_field(disabled_tools: set[str]) -> tuple[str, str, str]:
+    """Describe the resolved per-tool block list as a display row."""
+    name = "WORKSPACE_MCP_DISABLED_TOOLS"
+    if not disabled_tools:
+        return name, "not set", "off"
+    return name, ", ".join(sorted(disabled_tools)), "on"
+
+
 def _client_secret_field() -> tuple[str, str, str]:
     """Describe the OAuth client secret without revealing it."""
     name = "GOOGLE_OAUTH_CLIENT_SECRET"
@@ -346,13 +360,16 @@ def describe_credential_config() -> list[tuple[str, str, str]]:
     ]
 
 
-def describe_mode_config() -> list[tuple[str, str, str]]:
+def describe_mode_config(
+    disabled_tools: set[str] = frozenset(),
+) -> list[tuple[str, str, str]]:
     """Build the mode rows shown in the startup configuration section."""
     return [
         _flag_field("MCP_SINGLE_USER_MODE"),
         _flag_field("MCP_ENABLE_OAUTH21"),
         _flag_field("WORKSPACE_MCP_STATELESS_MODE"),
         _flag_field("OAUTHLIB_INSECURE_TRANSPORT", warn_when_true=True),
+        _disabled_tools_field(disabled_tools),
     ]
 
 
@@ -411,6 +428,16 @@ def main():
         "--tool-tier",
         choices=["core", "extended", "complete"],
         help="Load tools based on tier level. Can be combined with --tools to filter services.",
+    )
+    parser.add_argument(
+        "--disabled-tools",
+        nargs="+",
+        metavar="TOOL_NAME",
+        help=(
+            "Block individual tools by name regardless of tier or permission selection. "
+            "Composes with every other filtering option. "
+            "Env var: WORKSPACE_MCP_DISABLED_TOOLS (comma-separated)."
+        ),
     )
     parser.add_argument(
         "--transport",
@@ -473,6 +500,9 @@ def main():
                     "WORKSPACE_MCP_TOOL_TIER", _env_tier, "core, extended, or complete"
                 )
             args.tool_tier = _env_tier
+    # Subtractive, so it needs no conflict handling against the allowlist flags.
+    disabled_tools = resolve_disabled_tools(args.disabled_tools)
+    set_disabled_tools(disabled_tools)
     if not args.read_only and not _cli_has_permissions:
         _env_ro = os.getenv("WORKSPACE_MCP_READ_ONLY", "").strip().lower()
         if _env_ro:
@@ -597,7 +627,7 @@ def main():
     ui.fields(
         [
             ("Credentials", describe_credential_config()),
-            ("Modes", describe_mode_config()),
+            ("Modes", describe_mode_config(disabled_tools)),
         ]
     )
 

@@ -20,6 +20,7 @@ import pytest
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
+from gcalendar.calendar_helpers import _format_event_time
 from gcalendar.calendar_tools import get_events
 
 
@@ -59,9 +60,35 @@ async def _single_detail(item):
     )
 
 
+async def _ranged_basic(item):
+    """Basic output via the time_min/time_max branch."""
+    return await _unwrap(get_events)(
+        service=_mock_service([item]),
+        user_google_email="user@example.com",
+        time_min="2026-04-06T00:00:00Z",
+        time_max="2026-04-07T00:00:00Z",
+        detailed=False,
+    )
+
+
+async def _single_basic(item):
+    """Basic output via the event_id branch."""
+    return await _unwrap(get_events)(
+        service=_mock_service([item]),
+        user_google_email="user@example.com",
+        event_id=item["id"],
+        detailed=False,
+    )
+
+
 # Every test runs through both formatters. Their disagreement was the bug.
 both_branches = pytest.mark.parametrize(
     "detail", [_ranged_detail, _single_detail], ids=["ranged", "single"]
+)
+all_get_paths = pytest.mark.parametrize(
+    "read",
+    [_ranged_basic, _single_basic, _ranged_detail, _single_detail],
+    ids=["ranged-basic", "single-basic", "ranged-detailed", "single-detailed"],
 )
 
 RECURRING_INSTANCE = {
@@ -188,3 +215,108 @@ async def test_basic_ranged_output_is_unchanged():
 
     assert "Color ID" not in result
     assert "Recurring Event ID" not in result
+
+
+@pytest.mark.asyncio
+@all_get_paths
+@pytest.mark.parametrize(
+    "item,start_evidence,end_evidence",
+    [
+        (
+            {
+                **ORDINARY_MEETING,
+                "start": {"dateTime": "2026-08-20T17:15:00+02:00"},
+                "end": {"dateTime": "2026-08-20T18:00:00+02:00"},
+            },
+            "2026-08-20T17:15:00+02:00 [weekday: Thursday; ISO weekday: 4]",
+            "2026-08-20T18:00:00+02:00 [weekday: Thursday; ISO weekday: 4]",
+        ),
+        (
+            {
+                **ORDINARY_MEETING,
+                "start": {"dateTime": "2026-08-20T00:15:00+14:00"},
+                "end": {"dateTime": "2026-08-19T23:45:00-10:00"},
+            },
+            "2026-08-20T00:15:00+14:00 [weekday: Thursday; ISO weekday: 4]",
+            "2026-08-19T23:45:00-10:00 [weekday: Wednesday; ISO weekday: 3]",
+        ),
+        (
+            {
+                **ORDINARY_MEETING,
+                "start": {"dateTime": "2026-03-29T01:30:00+01:00"},
+                "end": {"dateTime": "2026-03-29T03:30:00+02:00"},
+            },
+            "2026-03-29T01:30:00+01:00 [weekday: Sunday; ISO weekday: 7]",
+            "2026-03-29T03:30:00+02:00 [weekday: Sunday; ISO weekday: 7]",
+        ),
+        (
+            {
+                **ORDINARY_MEETING,
+                "start": {"dateTime": "2026-08-20T23:30:00Z"},
+                "end": {"dateTime": "2026-08-21T00:30:00Z"},
+            },
+            "2026-08-20T23:30:00Z [weekday: Thursday; ISO weekday: 4]",
+            "2026-08-21T00:30:00Z [weekday: Friday; ISO weekday: 5]",
+        ),
+        (
+            {
+                **ORDINARY_MEETING,
+                "start": {"dateTime": "2026-08-20T17:15:00"},
+                "end": {"dateTime": "2026-08-20T18:00:00"},
+            },
+            "2026-08-20T17:15:00",
+            "2026-08-20T18:00:00",
+        ),
+        (
+            {
+                **ALL_FIELDS_INSTANCE,
+                "start": {"date": "2026-08-20"},
+                "end": {"date": "2026-08-22"},
+            },
+            "2026-08-20 [weekday: Thursday; ISO weekday: 4]",
+            "2026-08-22 [weekday: Saturday; ISO weekday: 6; exclusive all-day end]",
+        ),
+    ],
+    ids=["timed", "offset-crossing", "dst-offsets", "z", "offset-less", "all-day"],
+)
+async def test_get_events_always_retains_raw_times_with_deterministic_weekdays(
+    read, item, start_evidence, end_evidence
+):
+    result = await read(item)
+
+    assert f"Starts: {start_evidence}" in result
+    assert f"Ends: {end_evidence}" in result
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    [
+        {"dateTime": "20260820T171500+0200"},
+        {"dateTime": "2026-08-20T17:15:00+02"},
+        {"dateTime": "2026-08-20T17:15:00+02:00:30"},
+        {"dateTime": "2026-08-20T17:15:00,5+02:00"},
+        {"dateTime": "2026-08-20T24:00:00+02:00"},
+        {"dateTime": "2026-08-20T17:15:00+02:60"},
+        {"dateTime": "2026-08-20"},
+        {"date": "2026-08-20T17:15:00+02:00"},
+        {"date": "20260820"},
+        {"date": "2026-W34-4"},
+    ],
+    ids=[
+        "basic-datetime",
+        "short-offset",
+        "offset-seconds",
+        "comma-fraction",
+        "out-of-range-hour",
+        "out-of-range-offset-minute",
+        "date-in-datetime-field",
+        "datetime-in-date-field",
+        "compact-date",
+        "week-date",
+    ],
+)
+def test_format_event_time_preserves_non_google_formats(boundary):
+    """Python's permissive ISO parser must not define Google's wire format."""
+    value = next(iter(boundary.values()))
+
+    assert _format_event_time({"start": boundary}, "start") == value

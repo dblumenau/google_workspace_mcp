@@ -5,10 +5,54 @@ This module provides utility functions for formatting Google Calendar
 event data for display.
 """
 
+import datetime
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_WEEKDAYS = (
+    "Monday",
+    "Tuesday",
+    "Wednesday",
+    "Thursday",
+    "Friday",
+    "Saturday",
+    "Sunday",
+)
+
+_RFC3339_DATETIME = re.compile(
+    r"\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d"
+    r"(?:\.\d+)?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)"
+)
+_GOOGLE_ALL_DAY_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+
+def _format_event_time(item: Dict[str, Any], field: str) -> str:
+    """Format one raw Google event boundary with offset-local weekday evidence."""
+    boundary = item[field]
+    value = boundary.get("dateTime", boundary.get("date"))
+    if not isinstance(value, str):
+        return str(value)
+    try:
+        if "dateTime" in boundary:
+            if _RFC3339_DATETIME.fullmatch(value) is None:
+                return value
+            normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+            parsed = datetime.datetime.fromisoformat(normalized)
+            local_date = parsed.date()
+        else:
+            if _GOOGLE_ALL_DAY_DATE.fullmatch(value) is None:
+                return value
+            local_date = datetime.date.fromisoformat(value)
+    except ValueError:
+        return value
+    iso_weekday = local_date.isoweekday()
+    evidence = f"weekday: {_WEEKDAYS[iso_weekday - 1]}; ISO weekday: {iso_weekday}"
+    if field == "end" and "dateTime" not in boundary:
+        evidence += "; exclusive all-day end"
+    return f"{value} [{evidence}]"
 
 
 def _get_meeting_link(item: Dict[str, Any]) -> str:

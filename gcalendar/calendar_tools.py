@@ -20,6 +20,7 @@ from auth.service_decorator import require_google_service
 from core.utils import handle_http_errors, StringList
 from gcalendar.calendar_helpers import (
     _format_event_detail_lines,
+    _format_event_time,
     _get_meeting_link,
 )
 
@@ -467,8 +468,8 @@ async def get_events(
     if event_id and detailed:
         item = items[0]
         summary = item.get("summary", "No Title")
-        start = item["start"].get("dateTime", item["start"].get("date"))
-        end = item["end"].get("dateTime", item["end"].get("date"))
+        start = _format_event_time(item, "start")
+        end = _format_event_time(item, "end")
         link = item.get("htmlLink", "No Link")
 
         event_details = (
@@ -490,8 +491,8 @@ async def get_events(
     event_details_list = []
     for item in items:
         summary = item.get("summary", "No Title")
-        start_time = item["start"].get("dateTime", item["start"].get("date"))
-        end_time = item["end"].get("dateTime", item["end"].get("date"))
+        start_time = _format_event_time(item, "start")
+        end_time = _format_event_time(item, "end")
         link = item.get("htmlLink", "No Link")
         item_event_id = item.get("id", "No ID")
 
