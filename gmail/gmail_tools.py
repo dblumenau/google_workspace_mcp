@@ -16,14 +16,20 @@ import html
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Annotated, Optional, List, Dict, Literal, Any
-from urllib.parse import unquote, urlparse, urlunsplit
+from urllib.parse import quote, unquote, urlparse, urlunsplit
 
 from email.message import EmailMessage
 from email.policy import SMTP
 from email.utils import formataddr
 
 import httpx
-from mcp.types import ToolAnnotations
+from fastmcp.tools import ToolResult
+from mcp.types import (
+    BlobResourceContents,
+    EmbeddedResource,
+    TextContent,
+    ToolAnnotations,
+)
 
 from pydantic import Field
 from googleapiclient.errors import HttpError
@@ -33,6 +39,7 @@ from auth.service_decorator import require_google_service
 from core.attachment_storage import (
     get_attachment_storage,
     get_attachment_url,
+    sanitize_attachment_filename,
     STORAGE_DIR,
 )
 from core.config import (
@@ -887,6 +894,30 @@ def _format_extracted_text_block(text: str) -> List[str]:
             f"{len(text)} characters. Download the file for the full content.]"
         )
     return lines
+
+
+def _build_attachment_tool_result(
+    summary: str,
+    file_bytes: bytes,
+    filename: Optional[str],
+    mime_type: Optional[str],
+    include_file: bool,
+) -> ToolResult:
+    """Return metadata text plus a portable MCP embedded-file resource."""
+    content: list[Any] = [TextContent(type="text", text=summary)]
+    if include_file and file_bytes:
+        safe_filename = sanitize_attachment_filename(filename or "attachment")
+        content.append(
+            EmbeddedResource(
+                type="resource",
+                resource=BlobResourceContents(
+                    uri=f"file:///{quote(safe_filename)}",
+                    mimeType=mime_type or "application/octet-stream",
+                    blob=base64.b64encode(file_bytes).decode("ascii"),
+                ),
+            )
+        )
+    return ToolResult(content=content, structured_content={"result": summary})
 
 
 def _extract_attachments(payload: dict) -> List[Dict[str, Any]]:
@@ -2155,6 +2186,7 @@ _ATTACHMENT_METADATA_FIELDS = _attachment_metadata_fields(6)
 
 @server.tool(
     title="Get Gmail Attachment Content",
+    output_schema=None,
     annotations=ToolAnnotations(
         readOnlyHint=False,
         destructiveHint=False,
@@ -2172,9 +2204,11 @@ async def get_gmail_attachment_content(
     attachment_id: str,
     user_google_email: str,
     return_base64: bool = False,
-) -> str:
+    include_file: bool = True,
+) -> ToolResult | str:
     """
-    Downloads an email attachment, saves it to local disk, and extracts
+    Downloads an email attachment, returns it as a portable MCP file resource,
+    saves a temporary server-side backup, and extracts
     readable text server-side (Office XML documents via std-lib zip parsing,
     PDFs via pypdf, plain-text/UTF-8 content directly) into an
     EXTRACTED TEXT block, so clients can read document attachments without
@@ -2189,20 +2223,21 @@ async def get_gmail_attachment_content(
         attachment_id (str): The ID of the attachment to download.
         user_google_email (str): The user's Google email address. Required.
         return_base64 (bool): When True, includes the full attachment as a
-            standard base64 string in the response (in addition to any file
-            path or download URL). Useful for sandboxed clients that cannot
-            reach localhost download URLs or the MCP server's local file
-            paths (e.g. containerized agents with network allowlists). The
-            returned base64 uses the standard alphabet, so it can be passed
-            directly to tools like ``draft_gmail_message`` that expect
-            standard (not URL-safe) base64. Default False preserves the
-            existing behavior and response size.
+            standard base64 string in the text response. This is a legacy
+            compatibility escape hatch; clients that want the attachment
+            should use the default ``include_file=True`` MCP resource instead.
+            The returned base64 uses the standard alphabet, so it can be
+            passed directly to tools like ``draft_gmail_message``.
+        include_file (bool): When True (default), includes the attachment as an
+            MCP embedded-file resource so the client can present or save the
+            actual file regardless of which machine hosts this server. Set
+            False only when extracted text or attachment metadata is sufficient.
 
     Returns:
-        str: Attachment metadata with either a local file path or download URL,
-            an EXTRACTED TEXT block when the attachment contains extractable
-            text (capped at 50,000 characters), and optionally a base64
-            content block when ``return_base64=True``.
+        ToolResult: Attachment metadata, an MCP embedded-file resource by
+            default, an EXTRACTED TEXT block when available (capped at 50,000
+            characters), and optionally a base64 text block when
+            ``return_base64=True``. Download failures return an error string.
     """
     logger.info(
         f"[get_gmail_attachment_content] Invoked. Message ID: '{message_id}', Email: '{user_google_email}'"
@@ -2247,6 +2282,52 @@ async def get_gmail_attachment_content(
         )
         return _format_extracted_text_block(text) if text else []
 
+    # Resolve the original filename and MIME type before branching on storage
+    # mode. Embedded resources need this metadata even when disk storage is off.
+    filename = None
+    mime_type = None
+    try:
+        message_full = await asyncio.to_thread(
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=message_id,
+                format="full",
+                fields=_ATTACHMENT_METADATA_FIELDS,
+            )
+            .execute
+        )
+        payload = message_full.get("payload", {})
+        attachments = _extract_attachments(payload)
+
+        for att in attachments:
+            if att.get("attachmentId") == attachment_id:
+                filename = att.get("filename")
+                mime_type = att.get("mimeType")
+                break
+
+        if not filename and attachments:
+            size_matches = [
+                att
+                for att in attachments
+                if att.get("size") and abs(att["size"] - size_bytes) < 100
+            ]
+            if len(size_matches) == 1:
+                filename = size_matches[0].get("filename")
+                mime_type = size_matches[0].get("mimeType")
+                logger.warning(
+                    f"Attachment {attachment_id} matched by size fallback as '{filename}'"
+                )
+
+        if not filename and len(attachments) == 1:
+            filename = attachments[0].get("filename")
+            mime_type = attachments[0].get("mimeType")
+    except Exception:
+        logger.debug(
+            f"Could not fetch attachment metadata for {attachment_id}, using defaults"
+        )
+
     # Check if we're in stateless mode (can't save files)
     from auth.oauth_config import is_stateless_mode
 
@@ -2254,19 +2335,23 @@ async def get_gmail_attachment_content(
         result_lines = [
             "Attachment downloaded successfully!",
             f"Message ID: {message_id}",
+            f"Filename: {filename or 'attachment'}",
             f"Size: {size_kb:.1f} KB ({size_bytes} bytes)",
             "\n⚠️ Stateless mode: File storage disabled.",
-            "\nBase64-encoded content (first 100 characters shown):",
-            f"{base64_data[:100]}...",
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
         ]
-        result_lines.extend(await _extracted_text_lines(None))
+        if include_file and attachment_bytes:
+            result_lines.append("\n📎 Attachment included as an MCP file resource.")
+        result_lines.extend(await _extracted_text_lines(mime_type))
         if return_base64 and base64_data:
             result_lines.extend(_format_base64_content_block(base64_data))
         logger.info(
             f"[get_gmail_attachment_content] Successfully downloaded {size_kb:.1f} KB attachment (stateless mode)"
         )
-        return "\n".join(result_lines)
+        summary = "\n".join(result_lines)
+        return _build_attachment_tool_result(
+            summary, attachment_bytes, filename, mime_type, include_file
+        )
 
     # Save attachment to local disk and return file path
     try:
@@ -2274,54 +2359,6 @@ async def get_gmail_attachment_content(
         from core.config import get_transport_mode
 
         storage = get_attachment_storage()
-
-        # Try to get filename and mime type from message
-        filename = None
-        mime_type = None
-        try:
-            message_full = await asyncio.to_thread(
-                service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=message_id,
-                    format="full",
-                    fields=_ATTACHMENT_METADATA_FIELDS,
-                )
-                .execute
-            )
-            payload = message_full.get("payload", {})
-            attachments = _extract_attachments(payload)
-
-            # First try exact attachmentId match
-            for att in attachments:
-                if att.get("attachmentId") == attachment_id:
-                    filename = att.get("filename")
-                    mime_type = att.get("mimeType")
-                    break
-
-            # Fallback: match by size if exactly one attachment matches (IDs are ephemeral)
-            if not filename and attachments:
-                size_matches = [
-                    att
-                    for att in attachments
-                    if att.get("size") and abs(att["size"] - size_bytes) < 100
-                ]
-                if len(size_matches) == 1:
-                    filename = size_matches[0].get("filename")
-                    mime_type = size_matches[0].get("mimeType")
-                    logger.warning(
-                        f"Attachment {attachment_id} matched by size fallback as '{filename}'"
-                    )
-
-            # Last resort: if only one attachment, use its name
-            if not filename and len(attachments) == 1:
-                filename = attachments[0].get("filename")
-                mime_type = attachments[0].get("mimeType")
-        except Exception:
-            logger.debug(
-                f"Could not fetch attachment metadata for {attachment_id}, using defaults"
-            )
 
         # Save attachment to local disk
         result = storage.save_attachment(
@@ -2338,9 +2375,9 @@ async def get_gmail_attachment_content(
         ]
 
         if get_transport_mode() == "stdio":
-            result_lines.append(f"\n📎 Saved to: {result.path}")
+            result_lines.append(f"\nServer-local backup: {result.path}")
             result_lines.append(
-                "\nThe file has been saved to disk and can be accessed directly via the file path."
+                "\nThis path belongs to the MCP server and may not exist on the client machine."
             )
         else:
             download_url = get_attachment_url(result.file_id)
@@ -2351,6 +2388,9 @@ async def get_gmail_attachment_content(
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch."
         )
 
+        if include_file and attachment_bytes:
+            result_lines.append("\n📎 Attachment included as an MCP file resource.")
+
         result_lines.extend(await _extracted_text_lines(mime_type))
 
         if return_base64 and base64_data:
@@ -2359,7 +2399,10 @@ async def get_gmail_attachment_content(
         logger.info(
             f"[get_gmail_attachment_content] Successfully saved {size_kb:.1f} KB attachment to {result.path}"
         )
-        return "\n".join(result_lines)
+        summary = "\n".join(result_lines)
+        return _build_attachment_tool_result(
+            summary, attachment_bytes, filename, mime_type, include_file
+        )
 
     except Exception as e:
         logger.error(
@@ -2377,10 +2420,13 @@ async def get_gmail_attachment_content(
             f"\nError: {str(e)}",
             "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
         ]
-        result_lines.extend(await _extracted_text_lines(None))
+        result_lines.extend(await _extracted_text_lines(mime_type))
         if return_base64 and base64_data:
             result_lines.extend(_format_base64_content_block(base64_data))
-        return "\n".join(result_lines)
+        summary = "\n".join(result_lines)
+        return _build_attachment_tool_result(
+            summary, attachment_bytes, filename, mime_type, include_file
+        )
 
 
 @server.tool(

@@ -11,6 +11,8 @@ from typing import Any, Callable
 from unittest.mock import Mock
 
 import pytest
+from fastmcp.tools import ToolResult
+from mcp.types import BlobResourceContents, EmbeddedResource, TextContent
 
 from core.server import server
 from core.tool_registry import get_tool_components
@@ -45,6 +47,24 @@ def _unwrap(tool: Any) -> Callable[..., Any]:
     while hasattr(fn, "__wrapped__"):
         fn = fn.__wrapped__
     return fn
+
+
+def _result_text(result: ToolResult | str) -> str:
+    """Read the human-facing text block from a mixed MCP tool result."""
+    if isinstance(result, str):
+        return result
+    return "\n".join(
+        block.text for block in result.content if isinstance(block, TextContent)
+    )
+
+
+def _result_resource(result: ToolResult) -> EmbeddedResource:
+    """Return the single embedded attachment resource from a tool result."""
+    resources = [
+        block for block in result.content if isinstance(block, EmbeddedResource)
+    ]
+    assert len(resources) == 1
+    return resources[0]
 
 
 def _build_mock_service(
@@ -110,6 +130,8 @@ def test_get_gmail_attachment_content_schema_includes_return_base64():
     assert "return_base64" in schema
     assert schema["return_base64"]["type"] == "boolean"
     assert schema["return_base64"]["default"] is False
+    assert schema["include_file"]["type"] == "boolean"
+    assert schema["include_file"]["default"] is True
 
 
 def test_format_base64_content_block_converts_urlsafe_to_standard():
@@ -163,9 +185,89 @@ async def test_default_call_omits_base64_content(isolated_attachment_env):
         user_google_email="user@example.com",
     )
 
-    assert "Attachment downloaded successfully!" in result
-    assert "📦 Base64 content" not in result
-    assert "standard base64" not in result
+    assert "Attachment downloaded successfully!" in _result_text(result)
+    assert "📦 Base64 content" not in _result_text(result)
+    assert "standard base64" not in _result_text(result)
+
+    assert isinstance(result, ToolResult)
+    resource = _result_resource(result)
+    assert isinstance(resource.resource, BlobResourceContents)
+    assert str(resource.resource.uri).endswith("/test.png")
+    assert resource.resource.mimeType == "image/png"
+    assert base64.b64decode(resource.resource.blob) == payload
+    assert result.structured_content == {"result": _result_text(result)}
+
+
+@pytest.mark.asyncio
+async def test_include_file_false_omits_embedded_resource(isolated_attachment_env):
+    """Callers can opt out when they only need extracted text or metadata."""
+    payload = b"plain attachment text"
+    mock_service = _build_mock_service(
+        payload, filename="note.txt", mime_type="text/plain"
+    )
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=mock_service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+        include_file=False,
+    )
+
+    assert isinstance(result, ToolResult)
+    assert not any(isinstance(block, EmbeddedResource) for block in result.content)
+    assert "plain attachment text" in _result_text(result)
+
+
+@pytest.mark.asyncio
+async def test_stateless_mode_still_returns_portable_file(monkeypatch):
+    """Diskless deployments should return the attachment through MCP itself."""
+    import auth.oauth_config as oauth_config_module
+
+    monkeypatch.setattr(oauth_config_module, "is_stateless_mode", lambda: True)
+    payload = b"portable stateless attachment"
+    mock_service = _build_mock_service(
+        payload, filename="portable.txt", mime_type="text/plain"
+    )
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=mock_service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+    )
+
+    assert isinstance(result, ToolResult)
+    resource = _result_resource(result)
+    assert isinstance(resource.resource, BlobResourceContents)
+    assert str(resource.resource.uri).endswith("/portable.txt")
+    assert base64.b64decode(resource.resource.blob) == payload
+    assert "Stateless mode" in _result_text(result)
+
+
+@pytest.mark.asyncio
+async def test_stdio_path_is_labeled_server_local(
+    isolated_attachment_env, monkeypatch
+):
+    """A bridged stdio server must not claim its path exists on the client."""
+    import core.config as core_config_module
+
+    monkeypatch.setattr(core_config_module, "get_transport_mode", lambda: "stdio")
+    mock_service = _build_mock_service(
+        b"remote file", filename="remote.txt", mime_type="text/plain"
+    )
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=mock_service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+    )
+
+    text = _result_text(result)
+    assert "Server-local backup:" in text
+    assert "may not exist on the client machine" in text
+    assert "can be accessed directly" not in text
 
 
 @pytest.mark.asyncio
@@ -185,8 +287,8 @@ async def test_download_response_reports_sanitized_saved_filename(
         user_google_email="user@example.com",
     )
 
-    assert "Filename: RE: Foo?.eml" in result
-    assert "Saved filename: RE_ Foo_" in result
+    assert "Filename: RE: Foo?.eml" in _result_text(result)
+    assert "Saved filename: RE_ Foo_" in _result_text(result)
 
     saved_files = list(isolated_attachment_env.iterdir())
     assert len(saved_files) == 1
@@ -226,11 +328,11 @@ async def test_return_base64_true_includes_standard_base64_block(
         return_base64=True,
     )
 
-    assert "📦 Base64 content" in result
-    assert "standard base64" in result
+    assert "📦 Base64 content" in _result_text(result)
+    assert "standard base64" in _result_text(result)
 
     # Extract the base64 line (the one right after the header) and verify round-trip.
-    lines = result.splitlines()
+    lines = _result_text(result).splitlines()
     header_idx = next(
         (i for i, line in enumerate(lines) if "📦 Base64 content" in line), None
     )
@@ -257,10 +359,10 @@ async def test_return_base64_preserves_file_save_behavior(isolated_attachment_en
     )
 
     # Still returns the normal HTTP-mode output...
-    assert "Attachment downloaded successfully!" in result
-    assert "Download URL" in result
+    assert "Attachment downloaded successfully!" in _result_text(result)
+    assert "Download URL" in _result_text(result)
     # ...and includes the base64 block.
-    assert "📦 Base64 content" in result
+    assert "📦 Base64 content" in _result_text(result)
 
 
 @pytest.mark.asyncio
@@ -280,8 +382,8 @@ async def test_docx_attachment_includes_extracted_text(isolated_attachment_env):
         user_google_email="user@example.com",
     )
 
-    assert "--- EXTRACTED TEXT ---" in result
-    assert "Sveiki, this is the archive certificate" in result
+    assert "--- EXTRACTED TEXT ---" in _result_text(result)
+    assert "Sveiki, this is the archive certificate" in _result_text(result)
 
 
 @pytest.mark.asyncio
@@ -301,8 +403,8 @@ async def test_docx_extraction_sniffs_zip_when_mime_is_generic(
         user_google_email="user@example.com",
     )
 
-    assert "--- EXTRACTED TEXT ---" in result
-    assert "Sniffed content" in result
+    assert "--- EXTRACTED TEXT ---" in _result_text(result)
+    assert "Sniffed content" in _result_text(result)
 
 
 @pytest.mark.asyncio
@@ -327,8 +429,8 @@ async def test_pdf_attachment_routes_to_pdf_extractor(
         user_google_email="user@example.com",
     )
 
-    assert "--- EXTRACTED TEXT ---" in result
-    assert "Extracted PDF text" in result
+    assert "--- EXTRACTED TEXT ---" in _result_text(result)
+    assert "Extracted PDF text" in _result_text(result)
 
 
 @pytest.mark.asyncio
@@ -346,8 +448,8 @@ async def test_utf8_text_attachment_is_included_inline(isolated_attachment_env):
         user_google_email="user@example.com",
     )
 
-    assert "--- EXTRACTED TEXT ---" in result
-    assert "name,age" in result
+    assert "--- EXTRACTED TEXT ---" in _result_text(result)
+    assert "name,age" in _result_text(result)
 
 
 @pytest.mark.asyncio
@@ -368,8 +470,8 @@ async def test_unpadded_base64_attachment_is_extracted(isolated_attachment_env):
         user_google_email="user@example.com",
     )
 
-    assert "--- EXTRACTED TEXT ---" in result
-    assert "unpadded attachment text" in result
+    assert "--- EXTRACTED TEXT ---" in _result_text(result)
+    assert "unpadded attachment text" in _result_text(result)
 
 
 @pytest.mark.asyncio
@@ -389,7 +491,7 @@ async def test_binary_attachment_has_no_extracted_text_block(
         user_google_email="user@example.com",
     )
 
-    assert "--- EXTRACTED TEXT ---" not in result
+    assert "--- EXTRACTED TEXT ---" not in _result_text(result)
 
 
 def test_format_extracted_text_block_truncates_long_text():
@@ -452,8 +554,8 @@ async def test_resolves_correct_filename_for_nested_smime_attachment(
         user_google_email="user@example.com",
     )
 
-    assert "Filename: statement.pdf" in result
-    assert "smime.p7s" not in result
+    assert "Filename: statement.pdf" in _result_text(result)
+    assert "smime.p7s" not in _result_text(result)
     fields = metadata_get.call_args.kwargs["fields"]
     assert fields.count("parts(") == 6
     assert "data" not in fields
