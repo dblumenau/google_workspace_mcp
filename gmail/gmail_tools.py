@@ -88,6 +88,7 @@ def is_stateless_mode() -> bool:
     """Resolve stateless mode dynamically for startup configuration and tests."""
     return oauth_config.is_stateless_mode()
 
+
 GMAIL_BATCH_SIZE = 25
 # Smaller chunks for search-result header fetches: the batch endpoint executes
 # every get in a chunk concurrently server-side, and chunks of 25 metadata gets
@@ -801,7 +802,9 @@ def _resolve_extraction_mime_type(
             if any(n.startswith("word/") for n in names):
                 return "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             if any(n.startswith("xl/") for n in names):
-                return "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                return (
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
             if any(n.startswith("ppt/") for n in names):
                 return "application/vnd.openxmlformats-officedocument.presentationml.presentation"
         except (zipfile.BadZipFile, OSError):
@@ -1146,7 +1149,9 @@ async def _resolve_url_attachments(
             except UserInputError:
                 raise
             except Exception as exc:
-                label = att.filename or att.path or att.workspace_file_id or "attachment"
+                label = (
+                    att.filename or att.path or att.workspace_file_id or "attachment"
+                )
                 raise UserInputError(
                     f"Failed to resolve attachment {label}: {exc}"
                 ) from exc

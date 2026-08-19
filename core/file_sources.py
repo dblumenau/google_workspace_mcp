@@ -115,7 +115,9 @@ def resolve_local_file_source(
     if not isinstance(source, PortableFileSource):
         source = PortableFileSource.model_validate(source)
     if source.url:
-        raise ValueError("URL sources must be resolved by the caller's SSRF-safe stream.")
+        raise ValueError(
+            "URL sources must be resolved by the caller's SSRF-safe stream."
+        )
 
     source_filename: Optional[str] = None
     source_mime_type: Optional[str] = None
@@ -171,4 +173,3 @@ def resolve_local_file_source(
     if max_bytes is not None and size > max_bytes:
         raise UserInputError(f"File '{filename}' exceeds the {max_bytes}-byte limit.")
     return ResolvedPortableFile(path_obj.read_bytes(), filename, mime_type)
-

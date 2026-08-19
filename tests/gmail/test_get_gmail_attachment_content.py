@@ -250,9 +250,7 @@ async def test_stateless_mode_still_returns_portable_file(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stdio_path_is_labeled_server_local(
-    isolated_attachment_env, monkeypatch
-):
+async def test_stdio_path_is_labeled_server_local(isolated_attachment_env, monkeypatch):
     """A bridged stdio server must not claim its path exists on the client."""
     import core.config as core_config_module
 

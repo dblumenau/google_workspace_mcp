@@ -960,9 +960,7 @@ async def test_resolve_attachments_accepts_workspace_file_id(monkeypatch, tmp_pa
     )
     monkeypatch.setattr(file_sources, "get_attachment_storage", lambda: storage)
 
-    resolved = await _resolve_url_attachments(
-        [{"workspace_file_id": saved.file_id}]
-    )
+    resolved = await _resolve_url_attachments([{"workspace_file_id": saved.file_id}])
     assert resolved[0]["_resolved_bytes"] == b"workspace attachment"
     assert resolved[0]["filename"] == "report.txt"
 

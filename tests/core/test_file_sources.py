@@ -56,7 +56,4 @@ def test_expired_workspace_file_id_has_retry_guidance(monkeypatch):
     storage = AttachmentStorage()
     monkeypatch.setattr(file_sources, "get_attachment_storage", lambda: storage)
     with pytest.raises(UserInputError, match="Download or stage the file again"):
-        resolve_local_file_source(
-            PortableFileSource(workspace_file_id="missing-id")
-        )
-
+        resolve_local_file_source(PortableFileSource(workspace_file_id="missing-id"))

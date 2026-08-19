@@ -453,7 +453,11 @@ async def get_drive_file_content(
         "application/javascript",
         "application/x-yaml",
     }
-    if export_mime_type or mime_type.startswith("text/") or mime_type in textual_mime_types:
+    if (
+        export_mime_type
+        or mime_type.startswith("text/")
+        or mime_type in textual_mime_types
+    ):
         content, source_truncated = await _download_file_prefix(
             service, file_id, export_mime_type
         )

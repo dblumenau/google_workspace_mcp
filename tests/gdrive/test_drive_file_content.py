@@ -181,7 +181,9 @@ async def test_get_drive_file_content_caps_text():
         "webViewLink": "https://drive.google.com/file/text123",
     }
     with (
-        patch("gdrive.drive_tools.resolve_drive_item", return_value=("text123", metadata)),
+        patch(
+            "gdrive.drive_tools.resolve_drive_item", return_value=("text123", metadata)
+        ),
         _patch_downloader(b"x" * 60_000),
     ):
         result = await _unwrap(get_drive_file_content)(
@@ -209,7 +211,9 @@ async def test_office_above_extraction_limit_returns_file(monkeypatch):
     service.files().get_media.return_value = "req"
     monkeypatch.setenv("WORKSPACE_MCP_EXTRACT_MAX_BYTES", "4")
     with (
-        patch("gdrive.drive_tools.resolve_drive_item", return_value=("doc123", metadata)),
+        patch(
+            "gdrive.drive_tools.resolve_drive_item", return_value=("doc123", metadata)
+        ),
         patch("gdrive.drive_tools.is_stateless_mode", return_value=True),
         _patch_downloader(payload),
     ):

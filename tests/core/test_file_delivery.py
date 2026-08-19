@@ -34,7 +34,9 @@ async def test_exact_inline_limit_embeds_exact_bytes(monkeypatch):
         stateless=True,
     )
 
-    resource = next(item for item in result.content if isinstance(item, EmbeddedResource))
+    resource = next(
+        item for item in result.content if isinstance(item, EmbeddedResource)
+    )
     assert isinstance(resource.resource, BlobResourceContents)
     assert base64.b64decode(resource.resource.blob) == b"abcd"
     assert result.structured_content["size"] == 4
@@ -77,7 +79,9 @@ async def test_large_stateful_path_returns_link_without_reading(
 
     assert any(isinstance(item, ResourceLink) for item in result.content)
     assert result.structured_content["workspace_file_id"]
-    assert result.structured_content["download_url"].startswith("https://files.example/")
+    assert result.structured_content["download_url"].startswith(
+        "https://files.example/"
+    )
     assert not source.exists()
 
 
@@ -100,4 +104,3 @@ def test_invalid_inline_limit(monkeypatch):
     monkeypatch.setenv(file_delivery.INLINE_FILE_MAX_BYTES_ENV, "-1")
     with pytest.raises(ValueError, match="non-negative integer"):
         file_delivery.get_inline_file_max_bytes()
-

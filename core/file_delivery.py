@@ -28,15 +28,14 @@ from core.attachment_storage import (
     sanitize_attachment_filename,
 )
 from core.config import get_transport_mode
+
 DEFAULT_INLINE_FILE_MAX_BYTES = 8 * 1024 * 1024
 INLINE_FILE_MAX_BYTES_ENV = "WORKSPACE_MCP_INLINE_FILE_MAX_BYTES"
 
 
 def get_inline_file_max_bytes() -> int:
     """Return the configured maximum embedded-file size."""
-    raw_value = os.getenv(
-        INLINE_FILE_MAX_BYTES_ENV, str(DEFAULT_INLINE_FILE_MAX_BYTES)
-    )
+    raw_value = os.getenv(INLINE_FILE_MAX_BYTES_ENV, str(DEFAULT_INLINE_FILE_MAX_BYTES))
     try:
         value = int(raw_value)
     except ValueError as exc:
@@ -46,8 +45,7 @@ def get_inline_file_max_bytes() -> int:
         ) from exc
     if value < 0:
         raise ValueError(
-            f"{INLINE_FILE_MAX_BYTES_ENV} must be a non-negative integer, "
-            f"got {value}."
+            f"{INLINE_FILE_MAX_BYTES_ENV} must be a non-negative integer, got {value}."
         )
     return value
 
