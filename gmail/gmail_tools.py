@@ -767,6 +767,12 @@ def _normalize_attachment_content_id(content_id: Any) -> str:
     return cid_value
 
 
+def _decode_gmail_base64url(data: str) -> bytes:
+    """Decode Gmail base64url data, restoring optional RFC 4648 padding."""
+    padded = data + "=" * (-len(data) % 4)
+    return base64.urlsafe_b64decode(padded)
+
+
 def _format_base64_content_block(urlsafe_b64_data: str) -> List[str]:
     """
     Convert Gmail's URL-safe base64 attachment data to standard base64 and
@@ -786,7 +792,7 @@ def _format_base64_content_block(urlsafe_b64_data: str) -> List[str]:
         decode, returns a single warning line instead of raising.
     """
     try:
-        raw_bytes = base64.urlsafe_b64decode(urlsafe_b64_data)
+        raw_bytes = _decode_gmail_base64url(urlsafe_b64_data)
         standard_b64 = base64.b64encode(raw_bytes).decode("ascii")
         return [
             f"\n📦 Base64 content ({len(standard_b64)} chars, standard base64):",
@@ -2076,7 +2082,7 @@ async def get_gmail_attachment_content(
 
     # Gmail returns URL-safe base64; decode once for text extraction.
     try:
-        attachment_bytes = base64.urlsafe_b64decode(base64_data)
+        attachment_bytes = _decode_gmail_base64url(base64_data)
     except (binascii.Error, ValueError):
         attachment_bytes = b""
 

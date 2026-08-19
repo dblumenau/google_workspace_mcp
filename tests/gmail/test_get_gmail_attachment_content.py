@@ -52,9 +52,12 @@ def _build_mock_service(
     *,
     filename: str = "attachment.bin",
     mime_type: str = "application/octet-stream",
+    strip_base64_padding: bool = False,
 ) -> Mock:
     """Build a Mock google-api service returning ``payload`` as an attachment."""
     urlsafe_b64 = base64.urlsafe_b64encode(payload).decode("ascii")
+    if strip_base64_padding:
+        urlsafe_b64 = urlsafe_b64.rstrip("=")
 
     mock_service = Mock()
 
@@ -125,6 +128,16 @@ def test_format_base64_content_block_converts_urlsafe_to_standard():
     standard_b64 = lines[1]
     # Standard alphabet must round-trip back to the original bytes.
     assert base64.b64decode(standard_b64) == payload
+
+
+def test_format_base64_content_block_restores_missing_padding():
+    """Gmail base64url responses may omit optional RFC 4648 padding."""
+    payload = b"two bytes past a multiple of three"
+    unpadded_b64 = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+    lines = _format_base64_content_block(unpadded_b64)
+
+    assert base64.b64decode(lines[1]) == payload
 
 
 def test_format_base64_content_block_handles_invalid_input_gracefully():
@@ -335,6 +348,28 @@ async def test_utf8_text_attachment_is_included_inline(isolated_attachment_env):
 
     assert "--- EXTRACTED TEXT ---" in result
     assert "name,age" in result
+
+
+@pytest.mark.asyncio
+async def test_unpadded_base64_attachment_is_extracted(isolated_attachment_env):
+    """Text extraction should work when Gmail omits base64url padding."""
+    payload = b"unpadded attachment text"
+    mock_service = _build_mock_service(
+        payload,
+        filename="note.txt",
+        mime_type="text/plain",
+        strip_base64_padding=True,
+    )
+
+    result = await _unwrap(get_gmail_attachment_content)(
+        service=mock_service,
+        message_id="msg-1",
+        attachment_id="att-123",
+        user_google_email="user@example.com",
+    )
+
+    assert "--- EXTRACTED TEXT ---" in result
+    assert "unpadded attachment text" in result
 
 
 @pytest.mark.asyncio
