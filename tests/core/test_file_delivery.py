@@ -8,6 +8,8 @@ from mcp.types import BlobResourceContents, EmbeddedResource, ImageContent, Reso
 import core.attachment_storage as attachment_storage
 import core.file_delivery as file_delivery
 from core.attachment_storage import AttachmentStorage
+from core.staging_s3 import StagedFile
+import core.staging_s3 as staging_s3
 
 
 @pytest.fixture
@@ -104,3 +106,76 @@ def test_invalid_inline_limit(monkeypatch):
     monkeypatch.setenv(file_delivery.INLINE_FILE_MAX_BYTES_ENV, "-1")
     with pytest.raises(ValueError, match="non-negative integer"):
         file_delivery.get_inline_file_max_bytes()
+
+
+@pytest.mark.asyncio
+async def test_configured_staging_avoids_embedded_base64(monkeypatch):
+    monkeypatch.setattr(file_delivery, "staging_is_configured", lambda: True)
+    monkeypatch.setattr(
+        file_delivery,
+        "stage_bytes",
+        lambda *_args: StagedFile(
+            key="google-workspace/2026-08-31/id/report.pdf",
+            download_url="https://staging.example/report.pdf?signature=short-lived",
+            expires_in_seconds=3600,
+        ),
+    )
+
+    result = await file_delivery.deliver_file_bytes(
+        summary="ready",
+        file_bytes=b"pdf bytes that must not enter the MCP response",
+        filename="report.pdf",
+        mime_type="application/pdf",
+        stateless=False,
+    )
+
+    assert not any(isinstance(item, EmbeddedResource) for item in result.content)
+    assert any(isinstance(item, ResourceLink) for item in result.content)
+    assert result.structured_content["staged_key"].endswith("/report.pdf")
+    assert result.structured_content["download_url"].startswith(
+        "https://staging.example/"
+    )
+
+
+def test_partial_staging_configuration_fails_closed(monkeypatch):
+    for name in (
+        "WORKSPACE_STAGING_S3_ENDPOINT",
+        "WORKSPACE_STAGING_S3_BUCKET",
+        "WORKSPACE_STAGING_S3_ACCESS_KEY_ID",
+        "WORKSPACE_STAGING_S3_SECRET_ACCESS_KEY",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("WORKSPACE_STAGING_S3_BUCKET", "mcp-staging")
+
+    with pytest.raises(ValueError, match="Incomplete Workspace staging"):
+        staging_s3.staging_is_configured()
+
+
+@pytest.mark.asyncio
+async def test_configured_staging_delivers_path_and_removes_temporary_file(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "report.pdf"
+    source.write_bytes(b"streamed pdf bytes")
+    monkeypatch.setattr(file_delivery, "staging_is_configured", lambda: True)
+    monkeypatch.setattr(
+        file_delivery,
+        "stage_path",
+        lambda *_args: StagedFile(
+            key="google-workspace/2026-08-31/id/report.pdf",
+            download_url="https://staging.example/report.pdf?signature=short-lived",
+            expires_in_seconds=3600,
+        ),
+    )
+
+    result = await file_delivery.deliver_file_path(
+        summary="ready",
+        file_path=source,
+        filename="report.pdf",
+        mime_type="application/pdf",
+        stateless=True,
+    )
+
+    assert result.structured_content["staged_key"].endswith("/report.pdf")
+    assert any(isinstance(item, ResourceLink) for item in result.content)
+    assert not source.exists()

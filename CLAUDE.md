@@ -50,6 +50,8 @@ async def your_tool(service, param: str):
 
 **Transports.** `stdio` (default, MCP-over-stdio — stray stdout corrupts the JSON-RPC handshake; see the macOS stdout-capture guard at the top of `main.py`) or `streamable-http` (FastAPI/Starlette, multi-user). `core/cli.py` provides the `workspace-cli` "Code Mode" client for local or remote instances.
 
+**Portable downloads.** `core/file_delivery.py` is shared by Gmail and Drive downloads. When all `WORKSPACE_STAGING_S3_*` variables are configured, requested files are staged in the dedicated short-lived `mcp-staging` R2 bucket and returned as compact metadata plus a signed GET link; MCP responses contain no file bytes or base64. Partial staging configuration fails closed. `core/staging_s3.py` owns the upload and one-hour presign behavior. Production receives a bucket-only read/write credential from mcp-bridge, passed only to this child.
+
 ## Conventions
 
 - Tool names: imperative, ≤3 words. Descriptions: single present-tense sentence with parameter hints. Return native Python objects, not hand-built error strings — raise; the decorator/`core.utils.handle_http_errors` surface `ToolExecutionError`.

@@ -28,6 +28,7 @@ from core.attachment_storage import (
     sanitize_attachment_filename,
 )
 from core.config import get_transport_mode
+from core.staging_s3 import StagedFile, stage_bytes, stage_path, staging_is_configured
 
 DEFAULT_INLINE_FILE_MAX_BYTES = 8 * 1024 * 1024
 INLINE_FILE_MAX_BYTES_ENV = "WORKSPACE_MCP_INLINE_FILE_MAX_BYTES"
@@ -66,6 +67,7 @@ def _delivery_result(
     file_bytes: Optional[bytes] = None,
     saved: Optional[SavedAttachment] = None,
     fallback_url: Optional[str] = None,
+    staged: Optional[StagedFile] = None,
     content_kind: str = "resource",
 ) -> ToolResult:
     """Build a mixed-content result after any storage work is complete."""
@@ -79,7 +81,26 @@ def _delivery_result(
         "size": size,
     }
 
-    if saved is not None:
+    if staged is not None:
+        structured.update(
+            {
+                "staged_key": staged.key,
+                "download_url": staged.download_url,
+                "expires_in_seconds": staged.expires_in_seconds,
+            }
+        )
+        if include_file:
+            content.append(
+                ResourceLink(
+                    type="resource_link",
+                    name=safe_filename,
+                    uri=staged.download_url,
+                    mimeType=mime_type,
+                    size=size,
+                    description="Temporary signed download link.",
+                )
+            )
+    elif saved is not None:
         storage = get_attachment_storage()
         metadata = storage.get_attachment_metadata(saved.file_id) or {}
         download_url = get_attachment_url(saved.file_id)
@@ -147,6 +168,7 @@ def _append_delivery_summary(
     limit: int,
     size: int,
     transport: str,
+    staged: Optional[StagedFile] = None,
 ) -> str:
     lines = [summary]
     if embedded and include_file:
@@ -154,7 +176,15 @@ def _append_delivery_summary(
     elif not include_file:
         lines.append("\nPortable MCP file: omitted because include_file=False.")
 
-    if saved is not None:
+    if staged is not None:
+        lines.extend(
+            [
+                f"\nStaged key: {staged.key}",
+                f"Download URL: {staged.download_url}",
+                f"The signed download URL expires in {staged.expires_in_seconds} seconds.",
+            ]
+        )
+    elif saved is not None:
         url = get_attachment_url(saved.file_id)
         lines.extend(
             [
@@ -208,10 +238,16 @@ async def deliver_file_bytes(
     limit = get_inline_file_max_bytes()
     embed = include_file and limit > 0 and size <= limit
     saved: Optional[SavedAttachment] = None
+    staged: Optional[StagedFile] = None
 
     stateless = is_stateless_mode() if stateless is None else stateless
     transport = transport or get_transport_mode()
-    if not stateless:
+    if staging_is_configured() and include_file:
+        staged = await asyncio.to_thread(
+            stage_bytes, file_bytes, filename, resolved_mime
+        )
+        embed = False
+    elif not stateless:
         storage = get_attachment_storage()
 
         def _save() -> SavedAttachment:
@@ -244,6 +280,7 @@ async def deliver_file_bytes(
         limit=limit,
         size=size,
         transport=transport,
+        staged=staged,
     )
     return _delivery_result(
         summary=rendered_summary,
@@ -254,6 +291,7 @@ async def deliver_file_bytes(
         file_bytes=file_bytes if embed else None,
         saved=saved,
         fallback_url=effective_fallback,
+        staged=staged,
         content_kind=content_kind,
     )
 
@@ -277,14 +315,20 @@ async def deliver_file_path(
     embed = include_file and limit > 0 and size <= limit
     file_bytes: Optional[bytes] = None
     saved: Optional[SavedAttachment] = None
+    staged: Optional[StagedFile] = None
 
     stateless = is_stateless_mode() if stateless is None else stateless
     transport = transport or get_transport_mode()
     try:
-        if embed:
+        if staging_is_configured() and include_file:
+            staged = await asyncio.to_thread(
+                stage_path, file_path, filename, resolved_mime
+            )
+            embed = False
+        elif embed:
             file_bytes = await asyncio.to_thread(file_path.read_bytes)
 
-        if not stateless:
+        if staged is None and not stateless:
             storage = get_attachment_storage()
             try:
                 saved = await asyncio.to_thread(
@@ -299,7 +343,7 @@ async def deliver_file_path(
                         f"The file is {size} bytes and could not be staged for "
                         f"download: {exc}"
                     ) from exc
-        elif not embed and include_file and not fallback_url:
+        elif staged is None and not embed and include_file and not fallback_url:
             raise ToolError(
                 f"The file is {size} bytes, which exceeds the inline limit of "
                 f"{limit} bytes, and stateless mode cannot stage a download link."
@@ -315,6 +359,7 @@ async def deliver_file_path(
             limit=limit,
             size=size,
             transport=transport,
+            staged=staged,
         )
         return _delivery_result(
             summary=rendered_summary,
@@ -325,6 +370,7 @@ async def deliver_file_path(
             file_bytes=file_bytes,
             saved=saved,
             fallback_url=effective_fallback,
+            staged=staged,
             content_kind=content_kind,
         )
     finally:

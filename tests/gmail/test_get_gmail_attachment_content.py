@@ -1,8 +1,4 @@
-"""
-Tests for ``get_gmail_attachment_content``, in particular the ``return_base64``
-option added for sandboxed clients that cannot reach the MCP server's
-localhost download URLs or local file paths.
-"""
+"""Tests for portable Gmail attachment delivery and text extraction."""
 
 import base64
 import io
@@ -19,7 +15,6 @@ from core.server import server
 from core.tool_registry import get_tool_components
 from gmail.gmail_tools import (
     EXTRACTED_TEXT_CHAR_LIMIT,
-    _format_base64_content_block,
     _format_extracted_text_block,
     get_gmail_attachment_content,
 )
@@ -123,57 +118,18 @@ def isolated_attachment_env(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_get_gmail_attachment_content_schema_includes_return_base64():
-    """Published MCP schema should expose the public return_base64 parameter."""
+def test_get_gmail_attachment_content_schema_has_no_base64_escape_hatch():
+    """Published MCP schema must keep attachment bytes out of tool arguments."""
     components = get_tool_components(server)
     schema = components[get_gmail_attachment_content.__name__].parameters["properties"]
 
-    assert "return_base64" in schema
-    assert schema["return_base64"]["type"] == "boolean"
-    assert schema["return_base64"]["default"] is False
+    assert "return_base64" not in schema
     assert schema["include_file"]["type"] == "boolean"
     assert schema["include_file"]["default"] is True
 
 
-def test_format_base64_content_block_converts_urlsafe_to_standard():
-    """Helper should convert URL-safe base64 (Gmail API) to standard base64."""
-    # Payload whose base64 produces characters that differ between alphabets
-    # (the '+' vs '-' and '/' vs '_' substitutions kick in for certain bytes).
-    payload = bytes(range(256))
-    urlsafe_b64 = base64.urlsafe_b64encode(payload).decode("ascii")
-
-    lines = _format_base64_content_block(urlsafe_b64)
-
-    assert len(lines) == 2
-    assert "Base64 content" in lines[0]
-    assert "standard base64" in lines[0]
-
-    standard_b64 = lines[1]
-    # Standard alphabet must round-trip back to the original bytes.
-    assert base64.b64decode(standard_b64) == payload
-
-
-def test_format_base64_content_block_restores_missing_padding():
-    """Gmail base64url responses may omit optional RFC 4648 padding."""
-    payload = b"two bytes past a multiple of three"
-    unpadded_b64 = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-
-    lines = _format_base64_content_block(unpadded_b64)
-
-    assert base64.b64decode(lines[1]) == payload
-
-
-def test_format_base64_content_block_handles_invalid_input_gracefully():
-    """Invalid base64 shouldn't raise — it should return a warning line."""
-    lines = _format_base64_content_block("not valid base64 !!!")
-
-    assert len(lines) == 1
-    assert "Could not include base64 content" in lines[0]
-
-
 @pytest.mark.asyncio
-async def test_default_call_omits_base64_content(isolated_attachment_env):
-    """Without return_base64, the response should not contain the base64 block (backwards compat)."""
+async def test_default_call_delivers_attachment(isolated_attachment_env):
     payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
     mock_service = _build_mock_service(
         payload, filename="test.png", mime_type="image/png"
@@ -187,9 +143,6 @@ async def test_default_call_omits_base64_content(isolated_attachment_env):
     )
 
     assert "Attachment downloaded successfully!" in _result_text(result)
-    assert "📦 Base64 content" not in _result_text(result)
-    assert "standard base64" not in _result_text(result)
-
     assert isinstance(result, ToolResult)
     resource = _result_resource(result)
     assert isinstance(resource.resource, BlobResourceContents)
@@ -298,73 +251,6 @@ async def test_download_response_reports_sanitized_saved_filename(
     assert ":" not in saved_files[0].name
     assert "?" not in saved_files[0].name
     assert saved_files[0].read_bytes() == payload
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("payload", "filename", "mime_type"),
-    [
-        (
-            b"\x89PNG\r\n\x1a\n" + b"\xff" * 50 + bytes(range(200)),
-            "test.png",
-            "image/png",
-        ),
-        (b"PDF-ish\x00\x01\x02" + b"\xfe\xfd" * 128, "doc.pdf", "application/pdf"),
-        (bytes(range(256)), "full-range.bin", "application/octet-stream"),
-    ],
-)
-async def test_return_base64_true_includes_standard_base64_block(
-    isolated_attachment_env,
-    payload: bytes,
-    filename: str,
-    mime_type: str,
-):
-    """With return_base64=True, the response must contain decoded standard base64."""
-    mock_service = _build_mock_service(payload, filename=filename, mime_type=mime_type)
-
-    result = await _unwrap(get_gmail_attachment_content)(
-        service=mock_service,
-        message_id="msg-1",
-        attachment_id="att-123",
-        user_google_email="user@example.com",
-        return_base64=True,
-    )
-
-    assert "📦 Base64 content" in _result_text(result)
-    assert "standard base64" in _result_text(result)
-
-    # Extract the base64 line (the one right after the header) and verify round-trip.
-    lines = _result_text(result).splitlines()
-    header_idx = next(
-        (i for i, line in enumerate(lines) if "📦 Base64 content" in line), None
-    )
-    assert header_idx is not None, (
-        "Expected _format_base64_content_block to include the '📦 Base64 content' header"
-    )
-    standard_b64 = lines[header_idx + 1].strip()
-
-    assert base64.b64decode(standard_b64) == payload
-
-
-@pytest.mark.asyncio
-async def test_return_base64_preserves_file_save_behavior(isolated_attachment_env):
-    """return_base64 should be additive: file is still saved and path/URL still returned."""
-    payload = b"additive behavior check " + bytes(range(100))
-    mock_service = _build_mock_service(payload, filename="doc.bin")
-
-    result = await _unwrap(get_gmail_attachment_content)(
-        service=mock_service,
-        message_id="msg-1",
-        attachment_id="att-123",
-        user_google_email="user@example.com",
-        return_base64=True,
-    )
-
-    # Still returns the normal HTTP-mode output...
-    assert "Attachment downloaded successfully!" in _result_text(result)
-    assert "Download URL" in _result_text(result)
-    # ...and includes the base64 block.
-    assert "📦 Base64 content" in _result_text(result)
 
 
 @pytest.mark.asyncio

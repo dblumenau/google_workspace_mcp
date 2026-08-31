@@ -739,39 +739,6 @@ def _decode_gmail_base64url(data: str) -> bytes:
     return base64.urlsafe_b64decode(padded)
 
 
-def _format_base64_content_block(urlsafe_b64_data: str) -> List[str]:
-    """
-    Convert Gmail's URL-safe base64 attachment data to standard base64 and
-    format it as a labeled block of result lines.
-
-    The Gmail API returns attachment bodies in URL-safe base64 (per RFC 4648).
-    ``draft_gmail_message`` and most stdlib consumers expect standard base64
-    (``base64.b64decode``). Converting here keeps the response self-contained
-    so a caller can pass the bytes straight back into the draft flow without
-    knowing about the alphabet difference.
-
-    Args:
-        urlsafe_b64_data: URL-safe base64 string as returned by Gmail.
-
-    Returns:
-        A list of strings to extend onto ``result_lines``. On failure to
-        decode, returns a single warning line instead of raising.
-    """
-    try:
-        raw_bytes = _decode_gmail_base64url(urlsafe_b64_data)
-        standard_b64 = base64.b64encode(raw_bytes).decode("ascii")
-        return [
-            f"\n📦 Base64 content ({len(standard_b64)} chars, standard base64):",
-            standard_b64,
-        ]
-    except (binascii.Error, ValueError) as e:
-        logger.warning(
-            f"[get_gmail_attachment_content] Failed to convert attachment "
-            f"to standard base64: {e}"
-        )
-        return [f"\n⚠️ Could not include base64 content: {e}"]
-
-
 OFFICE_XML_MIME_TYPES = {
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",
@@ -2153,41 +2120,33 @@ async def get_gmail_attachment_content(
     message_id: str,
     attachment_id: str,
     user_google_email: str,
-    return_base64: bool = False,
     include_file: bool = True,
 ) -> ToolResult | str:
     """
-    Downloads an email attachment, returns it as a portable MCP file resource,
-    saves a temporary server-side backup, and extracts
+    Downloads an email attachment, returns it through the configured portable
+    file-delivery backend, and extracts
     readable text server-side (Office XML documents via std-lib zip parsing,
     PDFs via pypdf, plain-text/UTF-8 content directly) into an
     EXTRACTED TEXT block, so clients can read document attachments without
     access to the server's filesystem.
 
-    Small files are included as portable MCP resources. Stateful deployments
-    also return a temporary workspace file ID and download URL.
+    S3-staging deployments return a short-lived signed download link without
+    embedding the file in the MCP response. Other deployments may include
+    small files as portable MCP resources or return a workspace file ID.
     May re-fetch message metadata to resolve filename and MIME type.
 
     Args:
         message_id (str): The ID of the Gmail message containing the attachment.
         attachment_id (str): The ID of the attachment to download.
         user_google_email (str): The user's Google email address. Required.
-        return_base64 (bool): When True, includes the full attachment as a
-            standard base64 string in the text response. This is a legacy
-            compatibility escape hatch; clients that want the attachment
-            should use the default ``include_file=True`` MCP resource instead.
-            The returned base64 uses the standard alphabet, so it can be
-            passed directly to tools like ``draft_gmail_message``.
-        include_file (bool): When True (default), includes the attachment as an
-            MCP embedded-file resource so the client can present or save the
-            actual file regardless of which machine hosts this server. Set
-            False only when extracted text or attachment metadata is sufficient.
+        include_file (bool): When True (default), delivers the attachment using
+            the configured portable-file backend. Set False only when extracted
+            text or attachment metadata is sufficient.
 
     Returns:
-        ToolResult: Attachment metadata, an MCP embedded-file resource by
-            default, an EXTRACTED TEXT block when available (capped at 50,000
-            characters), and optionally a base64 text block when
-            ``return_base64=True``. Download failures return an error string.
+        ToolResult: Attachment metadata, a portable file link or resource, and
+            an EXTRACTED TEXT block when available (capped at 50,000
+            characters). Download failures return an error string.
     """
     logger.info(
         f"[get_gmail_attachment_content] Invoked. Message ID: '{message_id}', Email: '{user_google_email}'"
@@ -2288,8 +2247,6 @@ async def get_gmail_attachment_content(
         "\nNote: Attachment IDs are ephemeral. Always use IDs from the most recent message fetch.",
     ]
     result_lines.extend(await _extracted_text_lines(mime_type))
-    if return_base64 and base64_data:
-        result_lines.extend(_format_base64_content_block(base64_data))
     return await deliver_file_bytes(
         summary="\n".join(result_lines),
         file_bytes=attachment_bytes,
