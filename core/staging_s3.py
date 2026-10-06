@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -34,15 +35,25 @@ def staging_is_configured() -> bool:
     return bool(configured)
 
 
-def _client():
+@lru_cache(maxsize=2)
+def _build_client(endpoint: str, access_key_id: str, secret_access_key: str):
     import boto3
 
     return boto3.client(
         "s3",
-        endpoint_url=os.environ["WORKSPACE_STAGING_S3_ENDPOINT"],
+        endpoint_url=endpoint,
         region_name="auto",
-        aws_access_key_id=os.environ["WORKSPACE_STAGING_S3_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["WORKSPACE_STAGING_S3_SECRET_ACCESS_KEY"],
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+    )
+
+
+def _client():
+    # One client per credential set: building it parses the service model and is slow.
+    return _build_client(
+        os.environ["WORKSPACE_STAGING_S3_ENDPOINT"],
+        os.environ["WORKSPACE_STAGING_S3_ACCESS_KEY_ID"],
+        os.environ["WORKSPACE_STAGING_S3_SECRET_ACCESS_KEY"],
     )
 
 
