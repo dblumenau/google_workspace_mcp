@@ -117,18 +117,18 @@ Create a draft or fully replace an existing draft. Same capabilities as send but
 Operational Gmail settings errors such as rate limits abort draft creation instead of silently falling back to a potentially unintended sender.
 
 ### manage_gmail_draft
-List, read, or permanently delete Gmail drafts. Use the stable Draft ID from this tool when replacing a draft with `draft_gmail_message`.
+List, read, permanently delete, or send Gmail drafts. Use the stable Draft ID from this tool when replacing a draft with `draft_gmail_message`.
 
 | Parameter | Type | Required | Default | Notes |
 |-----------|------|----------|---------|-------|
-| action | string | yes | | `list`, `get`, or `delete` |
-| draft_id | string | conditional | | Required for `get` and `delete` |
+| action | string | yes | | `list`, `get`, `delete`, or `send` |
+| draft_id | string | conditional | | Required for `get`, `delete` and `send` |
 | query | string | no | | Gmail search query for `list` |
 | page_size | integer | no | 20 | Drafts per page, 1-50 |
 | page_token | string | no | | Pagination token for `list` |
 | body_format | string | no | `text` | `text`, `html`, or decoded `raw` MIME for `get` |
 
-The `delete` action permanently removes the draft instead of moving it to Trash.
+The `delete` action permanently removes the draft instead of moving it to Trash. The `send` action delivers the existing draft immediately by ID (no copy, no delete) and returns the sent Message ID and Thread ID; it is never retried, so check the Sent folder before repeating a send that failed with a network or server error.
 
 ---
 
@@ -241,7 +241,7 @@ Create or delete a filter.
 
 ### Drafts vs Send
 - Use `draft_gmail_message` when you want the user to review before sending. Pass `draft_id` to fully replace an existing draft without creating a duplicate. It supports `include_signature` (auto-appends Gmail signature) and `quote_original` (includes quoted reply text).
-- Use `manage_gmail_draft(action="list")` to discover stable Draft IDs, `action="get"` to inspect the complete current content before replacement, and `action="delete"` only when permanent deletion is intended.
+- Use `manage_gmail_draft(action="list")` to discover stable Draft IDs, `action="get"` to inspect the complete current content before replacement, `action="send"` to deliver a reviewed draft, and `action="delete"` only when permanent deletion is intended.
 - Use `send_gmail_message` for immediate delivery.
 
 ### Attachments

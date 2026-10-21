@@ -318,11 +318,21 @@ async def _fetch_with_retry(
 
 async def send_message_once(service, send_body: Dict[str, Any]) -> Dict[str, Any]:
     """Send a message without retries, flagging failures that may have delivered it."""
+    return await _execute_send_once(
+        service.users().messages().send(userId="me", body=send_body)
+    )
+
+
+async def send_draft_once(service, draft_id: str) -> Dict[str, Any]:
+    """Send an existing draft without retries, flagging failures that may have delivered it."""
+    return await _execute_send_once(
+        service.users().drafts().send(userId="me", body={"id": draft_id})
+    )
+
+
+async def _execute_send_once(request) -> Dict[str, Any]:
     try:
-        return await asyncio.to_thread(
-            service.users().messages().send(userId="me", body=send_body).execute,
-            num_retries=0,
-        )
+        return await asyncio.to_thread(request.execute, num_retries=0)
     except (
         HttpError,
         httplib2.HttpLib2ErrorWithResponse,

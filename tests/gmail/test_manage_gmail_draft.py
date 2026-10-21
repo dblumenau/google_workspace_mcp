@@ -1,9 +1,12 @@
 import base64
 import os
 import sys
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from fastmcp.exceptions import ToolError
+from googleapiclient.errors import HttpError
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
 
@@ -175,7 +178,58 @@ async def test_manage_gmail_draft_delete_is_permanent_and_confirmed():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("action", ["get", "delete"])
+async def test_manage_gmail_draft_send_sends_once_and_returns_ids():
+    mock_service = Mock()
+    mock_service.users().drafts().send().execute.return_value = {
+        "id": "sentmsg1",
+        "threadId": "thread789",
+    }
+
+    result = await _unwrap(manage_gmail_draft)(
+        service=mock_service,
+        user_google_email="user@example.com",
+        action="send",
+        draft_id="draft123",
+    )
+
+    drafts = mock_service.users.return_value.drafts.return_value
+    assert drafts.send.call_args.kwargs == {"userId": "me", "body": {"id": "draft123"}}
+    assert drafts.delete.call_count == 0
+    # Non-idempotent: the execute call must not request retries.
+    execute = drafts.send.return_value.execute
+    assert execute.call_count == 1
+    assert execute.call_args.kwargs.get("num_retries", 0) == 0
+    assert "Draft sent." in result
+    assert "Message ID: sentmsg1" in result
+    assert "Thread ID: thread789" in result
+    assert "https://mail.google.com/" in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        HttpError(resp=SimpleNamespace(status=503, reason="Unavailable"), content=b""),
+        TimeoutError("timed out"),
+    ],
+)
+async def test_manage_gmail_draft_send_reports_unknown_delivery_on_ambiguous_failure(
+    error,
+):
+    mock_service = Mock()
+    mock_service.users().drafts().send().execute.side_effect = error
+
+    with pytest.raises(ToolError, match="Check the Sent folder before sending again"):
+        await _unwrap(manage_gmail_draft)(
+            service=mock_service,
+            user_google_email="user@example.com",
+            action="send",
+            draft_id="draft123",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["get", "delete", "send"])
 async def test_manage_gmail_draft_requires_id_for_single_draft_actions(action):
     with pytest.raises(UserInputError, match=f"draft_id is required for the {action}"):
         await _unwrap(manage_gmail_draft)(
@@ -190,6 +244,11 @@ def test_manage_gmail_draft_is_extended_and_publishes_safe_schema():
 
     tool = get_tool_components(server)["manage_gmail_draft"]
     schema = tool.parameters
-    assert set(schema["properties"]["action"]["enum"]) == {"list", "get", "delete"}
+    assert set(schema["properties"]["action"]["enum"]) == {
+        "list",
+        "get",
+        "delete",
+        "send",
+    }
     assert schema["properties"]["page_size"]["minimum"] == 1
     assert schema["properties"]["page_size"]["maximum"] == 50

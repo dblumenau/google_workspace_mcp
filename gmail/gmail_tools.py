@@ -102,6 +102,7 @@ from gmail.gmail_helpers import (
     html_newlines_to_br,
     html_to_text_preserving_breaks,
     modify_gmail_thread_labels,
+    send_draft_once,
     send_message_once,
     update_gmail_filter,
 )
@@ -3710,12 +3711,15 @@ async def manage_gmail_draft(
     service,
     user_google_email: str,
     action: Annotated[
-        Literal["list", "get", "delete"],
-        Field(description="Draft operation to perform: list, get, or delete."),
+        Literal["list", "get", "delete", "send"],
+        Field(
+            description="Draft operation to perform: list, get, delete, or send. "
+            "send delivers the draft immediately and cannot be undone."
+        ),
     ],
     draft_id: Annotated[
         Optional[str],
-        Field(description="Gmail Draft ID. Required for get and delete."),
+        Field(description="Gmail Draft ID. Required for get, delete and send."),
     ] = None,
     query: Annotated[
         Optional[str],
@@ -3738,7 +3742,7 @@ async def manage_gmail_draft(
         Field(description="Body format for get: readable text, HTML, or raw MIME."),
     ] = "text",
 ) -> str:
-    """Lists, retrieves, or permanently deletes Gmail drafts by stable Draft ID."""
+    """Lists, retrieves, permanently deletes, or sends Gmail drafts by stable Draft ID."""
     logger.info(
         f"[manage_gmail_draft] Invoked. Email: '{user_google_email}', "
         f"Action: '{action}', Draft ID: '{draft_id or ''}'"
@@ -3772,6 +3776,16 @@ async def manage_gmail_draft(
             .execute
         )
         return _format_draft_content(draft, body_format)
+
+    if action == "send":
+        sent = await send_draft_once(service, draft_id)
+        sent_message_id = sent.get("id", "unknown")
+        sent_thread_id = sent.get("threadId", "unknown")
+        link_id = sent_thread_id if sent_thread_id != "unknown" else sent_message_id
+        return (
+            f"Draft sent. Message ID: {sent_message_id}; Thread ID: {sent_thread_id}\n"
+            f"Web Link: {_generate_gmail_web_url(link_id)}"
+        )
 
     await asyncio.to_thread(
         service.users().drafts().delete(userId="me", id=draft_id).execute,
