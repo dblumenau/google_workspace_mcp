@@ -68,6 +68,7 @@ def _delivery_result(
     saved: Optional[SavedAttachment] = None,
     fallback_url: Optional[str] = None,
     staged: Optional[StagedFile] = None,
+    saved_url: Optional[str] = None,
     content_kind: str = "resource",
 ) -> ToolResult:
     """Build a mixed-content result after any storage work is complete."""
@@ -103,7 +104,7 @@ def _delivery_result(
     elif saved is not None:
         storage = get_attachment_storage()
         metadata = storage.get_attachment_metadata(saved.file_id) or {}
-        download_url = get_attachment_url(saved.file_id)
+        download_url = saved_url or get_attachment_url(saved.file_id)
         structured.update(
             {
                 "workspace_file_id": saved.file_id,
@@ -169,6 +170,7 @@ def _append_delivery_summary(
     size: int,
     transport: str,
     staged: Optional[StagedFile] = None,
+    saved_url: Optional[str] = None,
 ) -> str:
     lines = [summary]
     if embedded and include_file:
@@ -185,7 +187,7 @@ def _append_delivery_summary(
             ]
         )
     elif saved is not None:
-        url = get_attachment_url(saved.file_id)
+        url = saved_url or get_attachment_url(saved.file_id)
         lines.extend(
             [
                 f"Saved filename: {sanitize_attachment_filename(Path(saved.path).name)}",
@@ -271,6 +273,12 @@ async def deliver_file_bytes(
         )
 
     effective_fallback = fallback_url if saved is None and not embed else None
+    # Signing a GCS URL is a network call, so keep it off the event loop.
+    saved_url = (
+        await asyncio.to_thread(get_attachment_url, saved.file_id)
+        if saved is not None
+        else None
+    )
     rendered_summary = _append_delivery_summary(
         summary,
         saved=saved,
@@ -281,6 +289,7 @@ async def deliver_file_bytes(
         size=size,
         transport=transport,
         staged=staged,
+        saved_url=saved_url,
     )
     return _delivery_result(
         summary=rendered_summary,
@@ -292,6 +301,7 @@ async def deliver_file_bytes(
         saved=saved,
         fallback_url=effective_fallback,
         staged=staged,
+        saved_url=saved_url,
         content_kind=content_kind,
     )
 
@@ -350,6 +360,12 @@ async def deliver_file_path(
             )
 
         effective_fallback = fallback_url if saved is None and not embed else None
+        # Signing a GCS URL is a network call, so keep it off the event loop.
+        saved_url = (
+            await asyncio.to_thread(get_attachment_url, saved.file_id)
+            if saved is not None
+            else None
+        )
         rendered_summary = _append_delivery_summary(
             summary,
             saved=saved,
@@ -360,6 +376,7 @@ async def deliver_file_path(
             size=size,
             transport=transport,
             staged=staged,
+            saved_url=saved_url,
         )
         return _delivery_result(
             summary=rendered_summary,
@@ -371,6 +388,7 @@ async def deliver_file_path(
             saved=saved,
             fallback_url=effective_fallback,
             staged=staged,
+            saved_url=saved_url,
             content_kind=content_kind,
         )
     finally:

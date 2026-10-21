@@ -11,14 +11,16 @@
 [![MCP Toplist](https://mcptoplist.com/badge/glama%2Ftaylorwilsdon%2Fgoogle_workspace_mcp.svg)](https://mcptoplist.com/server/glama%2Ftaylorwilsdon%2Fgoogle_workspace_mcp)
 [![Website](https://img.shields.io/badge/Website-workspacemcp.com-green.svg)](https://workspacemcp.com/?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=badge-website)
 
+<a href="https://workspacemcp.com/release-notes/v2?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=banner-release-v2"><img width="500" height="108.3" alt="readme-banner" src="https://github.com/user-attachments/assets/703faa65-875b-45fa-9600-b82c5d7208ba" /></a>
+
 *Full natural language control over Google Calendar, Drive, Gmail, Docs, Sheets, Slides, Forms, Tasks, Contacts, and Chat through all MCP clients, AI assistants and developer tools.*
 *Includes a full featured CLI & Code Mode for use with tools like Claude Code and Codex!*
 
-**The most feature-complete Google Workspace MCP server**, it can do things that Google's own tooling and the built in integrations with Claude and ChatGPT can't come close to. With multi-user support, rich fine-grained editing tools and the most extensive coverage of any Google Workspace tool in existence, Workspace MCP is in a different class.
+**The most feature-complete Google Workspace MCP server** is in a class of it's own: it can do things that Google's own tooling and the built in integrations with Claude and ChatGPT can't come close to with multi-user support, rich fine-grained editing tools and the most extensive coverage of any Workspace AI integration in existence. 
 
 By leveraging native OAuth 2.1, stateless deployment capability and external auth server & gateway passthrough auth support, it's also the only Workspace MCP you can host for your whole organization centrally & securely!
 
-###### Support for all free Google accounts & Google Workspace plans (Starter, Standard, Plus, Enterprise, Non Profit) with expanded app options like Chat & Spaces. <br/><br /> Interested in a private, managed cloud instance? [That can be arranged.](https://workspacemcp.com/workspace-mcp-cloud?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=hero-cloud)
+Supports all free Google accounts & Google Workspace plans with expanded app options like Chat & Spaces. <br/>Interested in a managed cloud instance? [That can be arranged](https://workspacemcp.com/workspace-mcp-cloud?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=hero-cloud) (starting at $5/mo).
 
 
 </div>
@@ -56,9 +58,9 @@ The README covers just enough to get you running, with extensive documentation o
 |:---|:---|
 | **[Quick&nbsp;Start](https://workspacemcp.com/quick-start?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=nav-quickstart)** | Google Cloud setup, credentials, and client connection with screenshots |
 | **[Full&nbsp;Documentation](https://workspacemcp.com/docs?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=nav-docs)** | Every tool, parameter, and auth mode |
-| **[Advanced&nbsp;Deployment](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=nav-deployment)** | Reverse proxy & nginx config, origin validation, credential store backends (GCS/CMEK), and the complete environment variable reference |
+| **[Advanced&nbsp;Deployment](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=nav-deployment)** | Reverse proxy & nginx config, origin validation, credential store backends (GCS/CMEK), [trusted-gateway identity](https://workspacemcp.com/docs/deployment/gateway-identity?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=nav-gateway-identity), and the complete environment variable reference |
 | **[Client&nbsp;Setup&nbsp;Guides](https://workspacemcp.com/guides?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=nav-guides)** | Claude Desktop/web Connectors, ChatGPT Developer Mode, and more |
-| **[FAQ&nbsp;&&nbsp;Troubleshooting](https://workspacemcp.com/welcome/faq?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=nav-faq)** | OAuth errors, redirect URIs, Google Chat setup, client quirks |
+| **[FAQ&nbsp;&&nbsp;Troubleshooting](https://workspacemcp.com/welcome/faq?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=nav-faq)** | Enabling Google APIs, OAuth errors, redirect URIs, Google Chat setup, client quirks |
 
 ## <span style="color:#adbcbc">Security & Compliance</span>
 
@@ -83,7 +85,7 @@ Full dependency tree in `pyproject.toml`, pinned in `uv.lock`.
 
 **For Legal & Procurement**
 
-This project is [MIT licensed](LICENSE) — not "open core," not "source available," not "free with a CLA." There is no dual licensing, no commercial tier gating features, and no contributor license agreement.
+This project is [MIT licensed](LICENSE) — 
 
 - **Use commercially without restriction** — build products, sell services, deploy internally
 - **Fork, embed, redistribute** — MIT requires only attribution
@@ -162,7 +164,9 @@ Each page lists every tool with its tier, parameters, required scopes, and examp
 
 > Set credentials → pick a launch command → connect your client. Full walkthrough with screenshots: **[workspacemcp.com/quick-start](https://workspacemcp.com/quick-start?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=quickstart-hero)**
 
-You'll need an OAuth client from [Google Cloud Console](https://console.cloud.google.com/) with the APIs enabled for the services you plan to use - the [quick start guide](https://workspacemcp.com/quick-start?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=quickstart-inline) walks through it in about five minutes.
+You'll need an OAuth client from [Google Cloud Console](https://console.cloud.google.com/) in a project with the Google APIs enabled for the services you plan to use. The docs have [one-click enable links for every API](https://workspacemcp.com/docs?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=quickstart-enable-apis#authentication) plus a single `gcloud services enable` command that covers them all, and the [quick start guide](https://workspacemcp.com/quick-start?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=quickstart-inline) walks through the whole setup in about five minutes.
+
+> **Agentic OAuth clients:** this server only calls Google's REST APIs, so your OAuth client does not need Google's "Use this client for an AI-powered agent" setting. If your organization wants agent traffic labeled for admin controls, create a separate client with that setting enabled; it can't be changed on an existing client after November 12, 2026.
 
 <table>
 <tr>
@@ -195,6 +199,8 @@ uvx workspace-mcp --tools gmail drive calendar
 export MCP_ENABLE_OAUTH21=true
 export GOOGLE_OAUTH_CLIENT_ID="..."
 export GOOGLE_OAUTH_CLIENT_SECRET="..."
+#    Alternatively, point GOOGLE_CLIENT_SECRET_PATH at a client_secret.json
+#    that contains the client id and secret (env vars take precedence).
 export WORKSPACE_MCP_PORT=8000
 export GOOGLE_OAUTH_REDIRECT_URI="http://localhost:${WORKSPACE_MCP_PORT}/oauth2callback"
 export OAUTHLIB_INSECURE_TRANSPORT=1
@@ -247,10 +253,25 @@ Everything you need to run this in production lives in two places. The [document
 - **[OAuth proxy storage backends](https://workspacemcp.com/docs?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-proxy-storage#authentication)** - memory, disk, or Valkey/Redis for distributed setups
 - **[External OAuth provider mode](https://workspacemcp.com/docs?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-external-oauth#authentication)** - bring your own auth server, validate bearer tokens only
 - **[Service accounts with domain-wide delegation](https://workspacemcp.com/docs?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-service-accounts#authentication)** - per-request user impersonation with an optional domain allowlist
+- **[Trusted-gateway identity](https://workspacemcp.com/docs/deployment/gateway-identity?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-gateway-identity)** - proxy-verified per-user isolation with Pomerium, Cloudflare Access, oauth2-proxy, or any JWKS-verifiable gateway
 - **[OpenTelemetry tracing](https://workspacemcp.com/docs?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-otel#server-modes)** - optional, off unless you configure an OTLP endpoint
 - **Docker** - `docker build -t workspace-mcp . && docker run -p 8000:8000 workspace-mcp`
 
 The **[Advanced Deployment guide](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-advanced)** covers self-hosting specifics: reverse proxy setup with `WORKSPACE_EXTERNAL_URL` (including the nginx `Origin: null` consent workaround, the `WORKSPACE_MCP_ALLOW_NULL_ORIGIN_CONSENT` escape hatch, and the `Referrer-Policy` pitfall), origin validation and VS Code webview allowlisting, credential store backends (local directory or GCS with CMEK enforcement), and the **[complete environment variable reference](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#environment-variables)**.
+
+Production tuning is all environment variables; the names below link to their reference entries.
+
+- **Google API requests:** [`WORKSPACE_MCP_GOOGLE_API_WORKERS`](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#WORKSPACE_MCP_GOOGLE_API_WORKERS), [`WORKSPACE_MCP_GOOGLE_API_TIMEOUT_SECONDS`](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#WORKSPACE_MCP_GOOGLE_API_TIMEOUT_SECONDS)
+- **External OAuth token validation:** [`WORKSPACE_MCP_TOKEN_VALIDATION_WORKERS`](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#WORKSPACE_MCP_TOKEN_VALIDATION_WORKERS), [`WORKSPACE_MCP_TOKEN_VALIDATION_CACHE_TTL`](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#WORKSPACE_MCP_TOKEN_VALIDATION_CACHE_TTL)
+- **Memory ceilings:** [`WORKSPACE_MCP_MAX_FILE_BYTES`](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#WORKSPACE_MCP_MAX_FILE_BYTES), [`WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES`](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#WORKSPACE_MCP_STATELESS_INLINE_MAX_BYTES), [`WORKSPACE_MCP_MAX_OFFICE_XML_BYTES`](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#WORKSPACE_MCP_MAX_OFFICE_XML_BYTES)
+- **Sessions and health probes:** [`WORKSPACE_MCP_SESSION_IDLE_TIMEOUT`](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#WORKSPACE_MCP_SESSION_IDLE_TIMEOUT), [`WORKSPACE_MCP_READINESS_TIMEOUT_SECONDS`](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#WORKSPACE_MCP_READINESS_TIMEOUT_SECONDS)
+- **DNS-rebinding protection:** `WORKSPACE_MCP_ALLOWED_HOSTS`, a comma-separated list of hostnames without ports (for example `workspace-mcp,10.0.0.5`). When set, requests whose `Host` is not loopback, listed, or the host of `WORKSPACE_EXTERNAL_URL` or an allowed origin get `403`, so include every name clients and health probes use. Unset, any `Host` is accepted.
+- **Hosted servers without access to the caller's disk:** [`WORKSPACE_MCP_DISABLE_LOCAL_FILES`](https://workspacemcp.com/docs/deployment?utm_source=github.com&utm_medium=referral&utm_campaign=readme&utm_content=deploy-env-vars#WORKSPACE_MCP_DISABLE_LOCAL_FILES)
+  With local files disabled, `create_drive_file`, `update_drive_file` and the import tools offer `return_upload_url`: the caller PUTs the bytes to the returned URL. If the file sits in a cloud-mirrored folder (Drive for desktop), copy it to a local directory first, since mirrored paths can stall mid-upload.
+- **OAuth 2.1 token refresh and lifetimes:** see [`.env.oauth21`](.env.oauth21)
+- **OAuth 2.1 consent screen:** `WORKSPACE_MCP_OAUTH_PROXY_REQUIRE_CONSENT=remember` shows the OAuth proxy's consent screen once per browser for each MCP client instead of on every authorization; cross-site navigations are still prompted. The default, `always`, prompts every time. Any other value fails startup.
+
+For downloads, horizontally scaled or scale-to-zero HTTP deployments (Cloud Run, Kubernetes) can stage attachments in Google Cloud Storage instead of instance-local disk, whose `/attachments/{id}` URL may reach a different instance. Install the `gcs` extra and set `WORKSPACE_MCP_FILES_GCS_BUCKET` to a bucket name; objects are written under `WORKSPACE_MCP_FILES_GCS_PREFIX` (default `attachments`) and handed out as V4 signed URLs valid for one hour, which the client fetches straight from GCS. This also lets stateless mode return download URLs instead of inline files. stdio ignores the setting, since its client reads the local file path directly. The runtime service account needs object read and write access on the bucket — `roles/storage.objectUser`, or `roles/storage.objectCreator` plus `roles/storage.objectViewer` — and, without an exported private key, `roles/iam.serviceAccountTokenCreator` on itself so URLs can be signed through IAM. Read access is not optional: a signed URL carries the signer's authority, so without `storage.objects.get` the upload and the signing both succeed while the client's download fails with `403`. Objects are not deleted by the server, so add a bucket lifecycle rule that removes them after a few hours.
 
 ## Security Best Practices
 

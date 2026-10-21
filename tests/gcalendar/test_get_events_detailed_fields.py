@@ -39,15 +39,31 @@ def _mock_service(items):
     return mock_service
 
 
-async def _ranged_detail(item):
-    """Detailed output via the time_min/time_max branch."""
-    return await _unwrap(get_events)(
-        service=_mock_service([item]),
+async def _ranged_detail(item, *, single_events=True):
+    """Detailed output via the time_min/time_max branch.
+
+    Also asserts the forwarded request matches what was asked for, so tests
+    using this helper check the actual events.list() call, not just the
+    formatted text it produced.
+    """
+    service = _mock_service([item])
+    result = await _unwrap(get_events)(
+        service=service,
         user_google_email="user@example.com",
         time_min="2026-04-06T00:00:00Z",
         time_max="2026-04-07T00:00:00Z",
         detailed=True,
+        single_events=single_events,
     )
+
+    params = service.events().list.call_args.kwargs
+    assert params["singleEvents"] is single_events
+    if single_events:
+        assert params["orderBy"] == "startTime"
+    else:
+        assert "orderBy" not in params
+
+    return result
 
 
 async def _single_detail(item):
@@ -90,6 +106,9 @@ all_get_paths = pytest.mark.parametrize(
     [_ranged_basic, _single_basic, _ranged_detail, _single_detail],
     ids=["ranged-basic", "single-basic", "ranged-detailed", "single-detailed"],
 )
+basic_branches = pytest.mark.parametrize(
+    "read", [_ranged_basic, _single_basic], ids=["ranged", "single"]
+)
 
 RECURRING_INSTANCE = {
     "id": "evt123_20260406T090000Z",
@@ -99,6 +118,25 @@ RECURRING_INSTANCE = {
     "htmlLink": "https://calendar.google.com/event?eid=evt123",
     "colorId": "8",
     "recurringEventId": "evt123",
+    "status": "confirmed",
+}
+
+RECURRING_SERIES = {
+    "id": "evt123",
+    "summary": "Standup",
+    "start": {
+        "dateTime": "2026-04-06T09:00:00Z",
+        "timeZone": "Europe/London",
+    },
+    "end": {
+        "dateTime": "2026-04-06T09:15:00Z",
+        "timeZone": "Europe/London",
+    },
+    "htmlLink": "https://calendar.google.com/event?eid=evt123",
+    "recurrence": [
+        "RRULE:FREQ=WEEKLY;INTERVAL=4;BYDAY=MO",
+        "EXDATE:20260504T090000Z",
+    ],
     "status": "confirmed",
 }
 
@@ -125,6 +163,16 @@ ORDINARY_MEETING = {
     "htmlLink": "https://calendar.google.com/event?eid=evt1",
     "eventType": "default",
     "status": "confirmed",
+}
+
+CANCELLED_RECURRING_EXCEPTION = {
+    "id": "evt123_20260420T090000Z",
+    "status": "cancelled",
+    "recurringEventId": "evt123",
+    "originalStartTime": {
+        "dateTime": "2026-04-20T11:00:00+02:00",
+        "timeZone": "Europe/Paris",
+    },
 }
 
 
@@ -215,6 +263,141 @@ async def test_basic_ranged_output_is_unchanged():
 
     assert "Color ID" not in result
     assert "Recurring Event ID" not in result
+    assert "Status:" not in result
+
+
+@pytest.mark.asyncio
+@basic_branches
+async def test_basic_output_surfaces_cancelled_status(read):
+    """A cancelled event must not read like a live one in compact output."""
+    result = await read({**ORDINARY_MEETING, "status": "cancelled"})
+
+    assert "Status: cancelled" in result
+
+
+@pytest.mark.asyncio
+@basic_branches
+async def test_basic_output_omits_tentative_status(read):
+    """Only cancellation is surfaced; tentative events are still real meetings."""
+    result = await read({**ORDINARY_MEETING, "status": "tentative"})
+
+    assert "Status:" not in result
+
+
+@pytest.mark.asyncio
+@both_branches
+async def test_detailed_recurring_master_emits_lossless_recurrence(detail):
+    """Detailed output preserves every recurrence line from a series master."""
+    result = await detail(RECURRING_SERIES)
+
+    assert (
+        'Recurrence: ["RRULE:FREQ=WEEKLY;INTERVAL=4;BYDAY=MO", '
+        '"EXDATE:20260504T090000Z"]' in result
+    )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_recurring_exception_uses_original_start_time():
+    """Sparse Google tombstones render as exclusions instead of crashing."""
+    result = await _single_detail(CANCELLED_RECURRING_EXCEPTION)
+
+    assert "Starts: 2026-04-20T11:00:00+02:00" in result
+    assert "Ends: Unavailable" in result
+    assert (
+        'Original Start Time: {"dateTime": "2026-04-20T11:00:00+02:00", '
+        '"timeZone": "Europe/Paris"}' in result
+    )
+    assert "Recurring Event ID: evt123" in result
+    assert "Status: cancelled" in result
+
+
+@pytest.mark.asyncio
+async def test_ranged_cancelled_exception_uses_original_start_time():
+    """Unexpanded ranges render sparse cancelled exceptions."""
+    result = await _ranged_detail(CANCELLED_RECURRING_EXCEPTION, single_events=False)
+
+    assert "Starts: 2026-04-20T11:00:00+02:00" in result
+    assert "Ends: Unavailable" in result
+    assert (
+        'Original Start Time: {"dateTime": "2026-04-20T11:00:00+02:00", '
+        '"timeZone": "Europe/Paris"}' in result
+    )
+    assert "Recurring Event ID: evt123" in result
+    assert "Status: cancelled" in result
+
+
+@pytest.mark.asyncio
+async def test_all_day_cancelled_exception_uses_original_date():
+    """All-day exclusions use originalStartTime.date as their start boundary."""
+    result = await _ranged_detail(
+        {
+            **CANCELLED_RECURRING_EXCEPTION,
+            "originalStartTime": {"date": "2026-04-20"},
+        },
+        single_events=False,
+    )
+
+    assert "Starts: 2026-04-20" in result
+    assert "Ends: Unavailable" in result
+    assert 'Original Start Time: {"date": "2026-04-20"}' in result
+
+
+@pytest.mark.asyncio
+async def test_get_events_can_return_unexpanded_recurring_masters():
+    """Unexpanded requests reach Google without start-time ordering."""
+    service = _mock_service([RECURRING_SERIES])
+
+    await _unwrap(get_events)(
+        service=service,
+        user_google_email="user@example.com",
+        time_min="2026-04-01T00:00:00Z",
+        time_max="2026-05-01T00:00:00Z",
+        detailed=True,
+        single_events=False,
+    )
+
+    params = service.events().list.call_args.kwargs
+    assert params["singleEvents"] is False
+    assert "orderBy" not in params
+
+
+@pytest.mark.asyncio
+async def test_unexpanded_query_without_time_min_keeps_older_masters_discoverable():
+    """Do not filter masters by their first occurrence when no range was requested."""
+    older_series = {
+        **RECURRING_SERIES,
+        "start": {"dateTime": "2020-01-06T09:00:00Z"},
+        "end": {"dateTime": "2020-01-06T09:15:00Z"},
+        "recurrence": ["RRULE:FREQ=WEEKLY;BYDAY=MO"],
+    }
+    service = _mock_service([older_series])
+
+    await _unwrap(get_events)(
+        service=service,
+        user_google_email="user@example.com",
+        detailed=True,
+        single_events=False,
+    )
+
+    params = service.events().list.call_args.kwargs
+    assert "timeMin" not in params
+
+
+@pytest.mark.asyncio
+async def test_get_events_expands_recurring_series_by_default():
+    """The default request remains expanded and chronologically ordered."""
+    service = _mock_service([RECURRING_INSTANCE])
+
+    await _unwrap(get_events)(
+        service=service,
+        user_google_email="user@example.com",
+        time_min="2026-04-01T00:00:00Z",
+        time_max="2026-05-01T00:00:00Z",
+    )
+
+    params = service.events().list.call_args.kwargs
+    assert params["singleEvents"] is True
+    assert params["orderBy"] == "startTime"
 
 
 @pytest.mark.asyncio

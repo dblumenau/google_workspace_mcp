@@ -40,6 +40,8 @@ _MIME_TO_EXTENSION = {
     "text/html": ".html",
 }
 
+_MAX_FILE_NAME_BYTES = 255
+
 _WINDOWS_RESERVED_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _WINDOWS_RESERVED_NAMES = {
     "CON",
@@ -85,7 +87,13 @@ def _build_save_name(
         # The full file_id, not a prefix: a truncated one lets two distinct
         # attachments land on the same path, silently overwriting the first.
         safe_filename = Path(sanitize_attachment_filename(filename))
-        return f"{safe_filename.stem}_{file_id}{safe_filename.suffix}"
+        tail = f"_{file_id}{safe_filename.suffix}"
+        if len(tail.encode()) >= _MAX_FILE_NAME_BYTES:
+            tail = f"_{file_id}"
+        budget = _MAX_FILE_NAME_BYTES - len(tail.encode())
+        # Drop any character split by the byte cut.
+        stem = safe_filename.stem.encode()[:budget].decode(errors="ignore")
+        return f"{stem}{tail}"
     return f"{file_id}{_MIME_TO_EXTENSION.get(mime_type or '', '')}"
 
 
@@ -120,11 +128,6 @@ class AttachmentStorage:
         Returns:
             SavedAttachment with file_id (UUID) and path (absolute file path)
         """
-        _ensure_storage_dir()
-
-        # Generate unique file ID for metadata tracking
-        file_id = str(uuid.uuid4())
-
         # Decode base64 data
         try:
             file_bytes = base64.urlsafe_b64decode(base64_data)
@@ -132,6 +135,18 @@ class AttachmentStorage:
             logger.error(f"Failed to decode base64 attachment data: {e}")
             raise ValueError(f"Invalid base64 data: {e}")
 
+        return self.save_attachment_bytes(file_bytes, filename, mime_type)
+
+    def save_attachment_bytes(
+        self,
+        file_bytes: bytes,
+        filename: Optional[str] = None,
+        mime_type: Optional[str] = None,
+    ) -> SavedAttachment:
+        """Save an already-decoded attachment without a base64 round trip."""
+        _ensure_storage_dir()
+
+        file_id = str(uuid.uuid4())
         save_name = _build_save_name(file_id, filename, mime_type)
 
         # Save file with restrictive permissions (sensitive email/drive content)
@@ -145,8 +160,9 @@ class AttachmentStorage:
             try:
                 total_written = 0
                 data_len = len(file_bytes)
+                data_view = memoryview(file_bytes)
                 while total_written < data_len:
-                    written = os.write(fd, file_bytes[total_written:])
+                    written = os.write(fd, data_view[total_written:])
                     if written == 0:
                         raise OSError(
                             "os.write returned 0 bytes; could not write attachment data"
@@ -375,7 +391,20 @@ _attachment_storage: Optional[AttachmentStorage] = None
 
 
 def get_attachment_storage() -> AttachmentStorage:
-    """Get the global attachment storage instance."""
+    """Get the global attachment storage instance.
+
+    Returns the GCS-backed storage instead of local disk when
+    ``WORKSPACE_MCP_FILES_GCS_BUCKET`` is set on an HTTP transport.
+    """
+    # core.gcs_attachment_storage imports this module, so import it lazily.
+    from core.gcs_attachment_storage import (
+        gcs_files_enabled,
+        get_gcs_attachment_storage,
+    )
+
+    if gcs_files_enabled():
+        return get_gcs_attachment_storage()
+
     global _attachment_storage
     if _attachment_storage is None:
         _attachment_storage = AttachmentStorage()
@@ -393,6 +422,14 @@ def get_attachment_url(file_id: str) -> str:
     Returns:
         Full URL to access the attachment
     """
+    from core.gcs_attachment_storage import (
+        gcs_files_enabled,
+        get_gcs_attachment_storage,
+    )
+
+    if gcs_files_enabled():
+        return get_gcs_attachment_storage().get_signed_url(file_id)
+
     from core.config import WORKSPACE_MCP_PORT, WORKSPACE_MCP_BASE_URI
 
     # In stdio mode the attachment route is served by the lazily-started callback
