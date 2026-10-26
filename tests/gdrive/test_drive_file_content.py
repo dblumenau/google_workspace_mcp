@@ -221,8 +221,19 @@ async def test_get_drive_file_content_reports_oversized_expansion(
 
 
 @pytest.mark.asyncio
-async def test_get_drive_file_content_image(mock_resolve_image):
-    image_bytes = b"\x89PNG\r\n\x1a\n" + b"\x00" * 100
+@pytest.mark.parametrize(
+    "mime_type, magic",
+    [
+        ("image/png", b"\x89PNG\r\n\x1a\n"),
+        ("image/jpeg", b"\xff\xd8\xff\xe0"),
+        ("image/gif", b"GIF89a"),
+        ("image/webp", b"RIFF\x00\x00\x00\x00WEBP"),
+    ],
+    ids=["png", "jpeg", "gif", "webp"],
+)
+async def test_get_drive_file_content_image(mock_resolve_image, mime_type, magic):
+    mock_resolve_image.return_value[1]["mimeType"] = mime_type
+    image_bytes = magic + bytes(range(256)) * 4
     mock_service = Mock()
     mock_service.files().get_media.return_value = "req"
 
@@ -238,7 +249,7 @@ async def test_get_drive_file_content_image(mock_resolve_image):
 
     assert isinstance(result, ToolResult)
     image = next(item for item in result.content if isinstance(item, ImageContent))
-    assert image.mimeType == "image/png"
+    assert image.mime_type == mime_type
     assert base64.b64decode(image.data) == image_bytes
 
 
@@ -314,3 +325,28 @@ async def test_large_image_uses_drive_link(monkeypatch, mock_resolve_image):
         )
     assert any(isinstance(item, ResourceLink) for item in result.content)
     assert not any(isinstance(item, ImageContent) for item in result.content)
+
+
+@pytest.mark.asyncio
+async def test_get_drive_file_content_returns_svg_markup():
+    svg = b'<svg xmlns="http://www.w3.org/2000/svg"><circle r="4"/></svg>'
+    service = Mock()
+    service.files().get_media.return_value = "req"
+    metadata = {
+        "name": "dot.svg",
+        "mimeType": "image/svg+xml",
+        "webViewLink": "https://drive.google.com/file/svg123",
+    }
+    with (
+        patch(
+            "gdrive.drive_tools.resolve_drive_item", return_value=("svg123", metadata)
+        ),
+        _patch_downloader(svg),
+    ):
+        result = await _unwrap(get_drive_file_content)(
+            service=service,
+            user_google_email="user@example.com",
+            file_id="svg123",
+        )
+    assert isinstance(result, str)
+    assert result.endswith(svg.decode())

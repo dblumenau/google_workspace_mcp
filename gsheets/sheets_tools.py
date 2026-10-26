@@ -1929,6 +1929,19 @@ def _build_row_visibility_requests(sheet_id, row_nums, hidden, label):
     return reqs
 
 
+def _count_deleted_before(requests, dimension, index):
+    """Count positions in dimension deleted by requests that precede index."""
+    spans = [
+        req["deleteDimension"]["range"]
+        for req in requests
+        if "deleteDimension" in req
+        and req["deleteDimension"]["range"]["dimension"] == dimension
+    ]
+    return sum(
+        max(0, min(index, span["endIndex"]) - span["startIndex"]) for span in spans
+    )
+
+
 async def _resize_sheet_dimensions_impl(
     service,
     spreadsheet_id: str,
@@ -1956,6 +1969,11 @@ async def _resize_sheet_dimensions_impl(
     Manages sheet-level dimension properties: resize columns/rows, auto-resize
     to fit content, freeze rows/columns, hide/unhide rows/columns, and
     insert/delete rows/columns.
+
+    Every row number and column letter refers to the sheet as it was before
+    the call, even when one call both inserts and deletes. Deletes are applied
+    before inserts, and an insert position inside a deleted span lands where
+    that span was.
 
     Args:
         service: Google Sheets API service client.
@@ -2042,22 +2060,7 @@ async def _resize_sheet_dimensions_impl(
         .execute
     )
     sheets = metadata.get("sheets", [])
-    if not sheets:
-        raise UserInputError("No sheets found in spreadsheet.")
-
-    # Find target sheet
-    target_sheet = None
-    if sheet_name:
-        for sheet in sheets:
-            if sheet.get("properties", {}).get("title") == sheet_name:
-                target_sheet = sheet
-                break
-        if not target_sheet:
-            raise UserInputError(f"Sheet '{sheet_name}' not found.")
-    else:
-        target_sheet = sheets[0]
-
-    sheet_id = target_sheet["properties"]["sheetId"]
+    sheet_id = _select_sheet(sheets, sheet_name)["properties"]["sheetId"]
 
     requests = []
     applied_parts = []
@@ -2256,86 +2259,6 @@ async def _resize_sheet_dimensions_impl(
         )
         applied_parts.append(f"unhid rows: {', '.join(str(r) for r in unhide_rows)}")
 
-    # Build insert row requests
-    if insert_rows is not None:
-        if not isinstance(insert_rows, int) or insert_rows < 1:
-            raise UserInputError("insert_rows must be a positive integer.")
-        if insert_rows_at is not None:
-            if not isinstance(insert_rows_at, int) or insert_rows_at < 1:
-                raise UserInputError(
-                    "insert_rows_at must be a positive integer (1-based)."
-                )
-            start_idx = insert_rows_at - 1
-        else:
-            start_idx = None
-
-        if start_idx is not None:
-            requests.append(
-                {
-                    "insertDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": start_idx,
-                            "endIndex": start_idx + insert_rows,
-                        },
-                        "inheritFromBefore": start_idx > 0,
-                    }
-                }
-            )
-            applied_parts.append(
-                f"inserted {insert_rows} row(s) at row {insert_rows_at}"
-            )
-        else:
-            requests.append(
-                {
-                    "appendDimension": {
-                        "sheetId": sheet_id,
-                        "dimension": "ROWS",
-                        "length": insert_rows,
-                    }
-                }
-            )
-            applied_parts.append(f"appended {insert_rows} row(s)")
-
-    # Build insert column requests
-    if insert_columns is not None:
-        if not isinstance(insert_columns, int) or insert_columns < 1:
-            raise UserInputError("insert_columns must be a positive integer.")
-        if insert_columns_at is not None:
-            col_idx = _column_to_index(str(insert_columns_at).upper())
-            if col_idx is None:
-                raise UserInputError(
-                    f"Invalid column letter for insert_columns_at: '{insert_columns_at}'."
-                )
-            requests.append(
-                {
-                    "insertDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "COLUMNS",
-                            "startIndex": col_idx,
-                            "endIndex": col_idx + insert_columns,
-                        },
-                        "inheritFromBefore": col_idx > 0,
-                    }
-                }
-            )
-            applied_parts.append(
-                f"inserted {insert_columns} column(s) at column {insert_columns_at}"
-            )
-        else:
-            requests.append(
-                {
-                    "appendDimension": {
-                        "sheetId": sheet_id,
-                        "dimension": "COLUMNS",
-                        "length": insert_columns,
-                    }
-                }
-            )
-            applied_parts.append(f"appended {insert_columns} column(s)")
-
     # Reject mixing delete_rows and delete_row_range — their interleaved
     # deleteDimension requests shift indices unpredictably.
     if delete_rows and delete_row_range:
@@ -2343,6 +2266,9 @@ async def _resize_sheet_dimensions_impl(
             "delete_rows and delete_row_range cannot be used together. "
             "Specify one or the other."
         )
+
+    # Deletes run before inserts so every caller index refers to the original
+    # layout; insert positions are shifted past the deletions preceding them.
 
     # Build delete row requests (process in reverse to keep indices stable)
     if delete_rows:
@@ -2356,8 +2282,7 @@ async def _resize_sheet_dimensions_impl(
                 raise UserInputError(
                     f"Row number must be an integer >= 1 in delete_rows, got {row_num}."
                 ) from exc
-        sorted_rows = sorted(parsed_delete_rows, reverse=True)
-        for row_num in sorted_rows:
+        for row_num in sorted(set(parsed_delete_rows), reverse=True):
             if row_num < 1:
                 raise UserInputError(
                     f"Row number must be >= 1 in delete_rows, got {row_num}."
@@ -2419,17 +2344,15 @@ async def _resize_sheet_dimensions_impl(
     if delete_columns:
         if not isinstance(delete_columns, list):
             raise UserInputError("delete_columns must be a list of column letters.")
-        col_indices = []
+        col_indices = set()
         for col_letter in delete_columns:
             col_idx = _column_to_index(str(col_letter).upper())
             if col_idx is None:
                 raise UserInputError(
                     f"Invalid column letter in delete_columns: '{col_letter}'."
                 )
-            col_indices.append((col_letter, col_idx))
-        # Sort by index descending to keep indices stable during deletion
-        col_indices.sort(key=lambda x: x[1], reverse=True)
-        for _, col_idx in col_indices:
+            col_indices.add(col_idx)
+        for col_idx in sorted(col_indices, reverse=True):
             requests.append(
                 {
                     "deleteDimension": {
@@ -2445,6 +2368,88 @@ async def _resize_sheet_dimensions_impl(
         applied_parts.append(
             f"deleted columns: {', '.join(str(c) for c in delete_columns)}"
         )
+
+    # Build insert row requests
+    if insert_rows is not None:
+        if not isinstance(insert_rows, int) or insert_rows < 1:
+            raise UserInputError("insert_rows must be a positive integer.")
+        if insert_rows_at is not None:
+            if not isinstance(insert_rows_at, int) or insert_rows_at < 1:
+                raise UserInputError(
+                    "insert_rows_at must be a positive integer (1-based)."
+                )
+            start_idx = insert_rows_at - 1
+            start_idx -= _count_deleted_before(requests, "ROWS", start_idx)
+        else:
+            start_idx = None
+
+        if start_idx is not None:
+            requests.append(
+                {
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "ROWS",
+                            "startIndex": start_idx,
+                            "endIndex": start_idx + insert_rows,
+                        },
+                        "inheritFromBefore": start_idx > 0,
+                    }
+                }
+            )
+            applied_parts.append(
+                f"inserted {insert_rows} row(s) at row {insert_rows_at}"
+            )
+        else:
+            requests.append(
+                {
+                    "appendDimension": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "length": insert_rows,
+                    }
+                }
+            )
+            applied_parts.append(f"appended {insert_rows} row(s)")
+
+    # Build insert column requests
+    if insert_columns is not None:
+        if not isinstance(insert_columns, int) or insert_columns < 1:
+            raise UserInputError("insert_columns must be a positive integer.")
+        if insert_columns_at is not None:
+            col_idx = _column_to_index(str(insert_columns_at).upper())
+            if col_idx is None:
+                raise UserInputError(
+                    f"Invalid column letter for insert_columns_at: '{insert_columns_at}'."
+                )
+            col_idx -= _count_deleted_before(requests, "COLUMNS", col_idx)
+            requests.append(
+                {
+                    "insertDimension": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "dimension": "COLUMNS",
+                            "startIndex": col_idx,
+                            "endIndex": col_idx + insert_columns,
+                        },
+                        "inheritFromBefore": col_idx > 0,
+                    }
+                }
+            )
+            applied_parts.append(
+                f"inserted {insert_columns} column(s) at column {insert_columns_at}"
+            )
+        else:
+            requests.append(
+                {
+                    "appendDimension": {
+                        "sheetId": sheet_id,
+                        "dimension": "COLUMNS",
+                        "length": insert_columns,
+                    }
+                }
+            )
+            applied_parts.append(f"appended {insert_columns} column(s)")
 
     # Execute batch update
     await asyncio.to_thread(
@@ -2643,6 +2648,11 @@ async def resize_sheet_dimensions(
     Manages sheet-level dimension properties: resize columns/rows, auto-resize
     to fit content, freeze rows/columns, hide/unhide rows/columns, and
     insert/delete rows/columns.
+
+    Every row number and column letter refers to the sheet as it was before
+    the call, even when one call both inserts and deletes. Deletes are applied
+    before inserts, and an insert position inside a deleted span lands where
+    that span was.
 
     Args:
         user_google_email (str): The user's Google email address. Required.

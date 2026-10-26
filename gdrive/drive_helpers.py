@@ -255,6 +255,11 @@ TRASHED_CLAUSE_PATTERN = re.compile(r"\btrashed\s*!?=\s*(true|false)\b", re.IGNO
 QUERY_STRING_LITERAL_PATTERN = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"")
 
 
+def escape_drive_query_value(value: str) -> str:
+    """Escape a value for use inside a single-quoted Drive query string literal."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
 def has_explicit_trashed_clause(query: str) -> bool:
     """Return True when `query` contains a real `trashed =`/`!=` `true/false` predicate.
 

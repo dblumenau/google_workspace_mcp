@@ -6,7 +6,10 @@ of Google Docs documents, including finding tables, cells, and other elements.
 """
 
 import logging
+from collections.abc import Iterator
 from typing import Any, Optional
+
+from core.utils import UserInputError
 
 logger = logging.getLogger(__name__)
 
@@ -445,3 +448,108 @@ def analyze_document_complexity(doc_data: dict[str, Any]) -> dict[str, Any]:
         )
 
     return stats
+
+
+def _iter_tabs(tabs: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    for tab in tabs:
+        yield tab
+        yield from _iter_tabs(tab.get("childTabs", []))
+
+
+def _body_content_for_tab(
+    doc: dict[str, Any], tab_id: Optional[str]
+) -> list[dict[str, Any]]:
+    """Return the body content of ``tab_id``, or of the only tab when omitted."""
+    tabs = list(_iter_tabs(doc.get("tabs", [])))
+    if tab_id is None:
+        if len(tabs) > 1:
+            available = [t.get("tabProperties", {}).get("tabId") for t in tabs]
+            raise UserInputError(
+                f"Document has {len(tabs)} tabs; tab_id is required. "
+                f"Available tab IDs: {available}"
+            )
+        tab = tabs[0] if tabs else {"documentTab": doc}
+    else:
+        tab = next(
+            (t for t in tabs if t.get("tabProperties", {}).get("tabId") == tab_id),
+            None,
+        )
+        if tab is None:
+            raise UserInputError(f"tab_id {tab_id!r} not found in document.")
+    return tab.get("documentTab", {}).get("body", {}).get("content", [])
+
+
+def _paragraph_heading_level(paragraph: dict[str, Any]) -> Optional[int]:
+    """Return N for a ``HEADING_N`` paragraph, otherwise ``None``."""
+    style = paragraph.get("paragraphStyle", {}).get("namedStyleType", "")
+    return int(style[len("HEADING_") :]) if style.startswith("HEADING_") else None
+
+
+def find_heading_section(
+    doc: dict[str, Any],
+    heading: str,
+    heading_level: Optional[int] = None,
+    tab_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Locate the one body heading matching ``heading`` and the section below it.
+
+    The section runs to the next ``TITLE`` or equal-or-shallower heading, or to
+    the body's undeletable final newline. Returns ``body_start``,
+    ``section_end``, ``last_paragraph`` and ``footnote_refs``.
+    """
+    content = _body_content_for_tab(doc, tab_id)
+    wanted = heading.strip().casefold()
+    matches = []
+    for idx, element in enumerate(content):
+        paragraph = element.get("paragraph", {})
+        level = _paragraph_heading_level(paragraph)
+        if level is None or heading_level not in (None, level):
+            continue
+        if _extract_paragraph_text(paragraph).strip().casefold() == wanted:
+            matches.append(idx)
+    if not matches:
+        raise UserInputError(
+            f"No heading matching {heading!r} found in the document body "
+            f"(heading_level={heading_level!r}, tab_id={tab_id!r}). Headings inside "
+            "tables, footnotes, headers and footers are not addressable by heading; "
+            "use index-based editing for those."
+        )
+    if len(matches) > 1:
+        starts = ", ".join(str(content[idx].get("startIndex")) for idx in matches)
+        raise UserInputError(
+            f"Heading {heading!r} matches {len(matches)} headings (at indices "
+            f"{starts}). Pass heading_level to narrow it, or edit by index."
+        )
+
+    match_idx = matches[0]
+    matched_level = _paragraph_heading_level(content[match_idx]["paragraph"])
+    body_start = content[match_idx]["endIndex"]
+    section_end = None
+    last_paragraph = content[match_idx]
+    for element in content[match_idx + 1 :]:
+        paragraph = element.get("paragraph")
+        if not paragraph:
+            continue
+        level = _paragraph_heading_level(paragraph)
+        style = paragraph.get("paragraphStyle", {}).get("namedStyleType")
+        if style == "TITLE" or (level is not None and level <= matched_level):
+            section_end = element["startIndex"]
+            break
+        last_paragraph = element
+    if section_end is None:
+        # The body's final newline cannot be deleted.
+        section_end = last_paragraph["endIndex"] - 1
+
+    footnote_refs = sum(
+        1
+        for element in content[match_idx + 1 :]
+        for run in element.get("paragraph", {}).get("elements", [])
+        if "footnoteReference" in run
+        and body_start <= run.get("startIndex", -1) < section_end
+    )
+    return {
+        "body_start": body_start,
+        "section_end": section_end,
+        "last_paragraph": last_paragraph,
+        "footnote_refs": footnote_refs,
+    }

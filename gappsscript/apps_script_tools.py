@@ -540,25 +540,30 @@ async def _run_script_function_impl(
     return "\n".join(output)
 
 
-async def _resolve_execution_deployment_id(
-    service: Any,
-    script_id: str,
-) -> Optional[str]:
-    """Return the newest versioned API Executable deployment for a project."""
-    all_deployments = []
+async def _list_all_pages(list_method: Any, script_id: str, key: str) -> List[Any]:
+    """Collect every page of a script-scoped list call (deployments, versions)."""
+    items = []
     page_token = None
     while True:
         list_params = {"scriptId": script_id}
         if page_token:
             list_params["pageToken"] = page_token
 
-        response = await asyncio.to_thread(
-            service.projects().deployments().list(**list_params).execute
-        )
-        all_deployments.extend(response.get("deployments", []))
+        response = await asyncio.to_thread(list_method(**list_params).execute)
+        items.extend(response.get(key, []))
         page_token = response.get("nextPageToken")
         if not page_token:
-            break
+            return items
+
+
+async def _resolve_execution_deployment_id(
+    service: Any,
+    script_id: str,
+) -> Optional[str]:
+    """Return the newest versioned API Executable deployment for a project."""
+    all_deployments = await _list_all_pages(
+        service.projects().deployments().list, script_id, "deployments"
+    )
 
     candidates = [
         deployment
@@ -762,11 +767,9 @@ async def _list_deployments_impl(
     """Internal implementation for list_deployments."""
     logger.info(f"[list_deployments] Email: {user_google_email}, ID: {script_id}")
 
-    response = await asyncio.to_thread(
-        service.projects().deployments().list(scriptId=script_id).execute
+    deployments = await _list_all_pages(
+        service.projects().deployments().list, script_id, "deployments"
     )
-
-    deployments = response.get("deployments", [])
 
     if not deployments:
         return f"No deployments found for script: {script_id}"
@@ -1034,11 +1037,9 @@ async def _list_versions_impl(
     """Internal implementation for list_versions."""
     logger.info(f"[list_versions] Email: {user_google_email}, ScriptID: {script_id}")
 
-    response = await asyncio.to_thread(
-        service.projects().versions().list(scriptId=script_id).execute
+    versions = await _list_all_pages(
+        service.projects().versions().list, script_id, "versions"
     )
-
-    versions = response.get("versions", [])
 
     if not versions:
         return f"No versions found for script: {script_id}"

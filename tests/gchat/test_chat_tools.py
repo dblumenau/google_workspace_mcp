@@ -361,6 +361,54 @@ async def test_search_messages_reports_how_many_spaces_it_searched(
 
 @pytest.mark.asyncio
 @patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
+async def test_search_messages_pages_spaces_until_max_spaces(mock_resolve):
+    """max_spaces above one page of spaces should follow nextPageToken."""
+    mock_resolve.return_value = "Test User"
+
+    pages = {
+        None: {
+            "spaces": [{"name": f"spaces/A{i}"} for i in range(100)],
+            "nextPageToken": "page2",
+        },
+        "page2": {
+            "spaces": [{"name": f"spaces/B{i}"} for i in range(100)],
+            "nextPageToken": "page3",
+        },
+    }
+
+    def list_spaces(**kwargs):
+        request = Mock()
+        request.execute.return_value = pages[kwargs.get("pageToken")]
+        return request
+
+    chat_service = Mock()
+    chat_service.spaces().list.side_effect = list_spaces
+    chat_service.spaces().messages().list().execute.return_value = {"messages": []}
+    people_service = Mock()
+
+    from gchat.chat_tools import search_messages
+
+    result = await _unwrap(search_messages)(
+        chat_service=chat_service,
+        people_service=people_service,
+        user_google_email="test@example.com",
+        query="deploy",
+        max_spaces=150,
+    )
+
+    assert "in the first 150 accessible spaces." in result
+    assert chat_service.spaces().list.call_count == 2
+    searched = [
+        call.kwargs["parent"]
+        for call in chat_service.spaces().messages().list.call_args_list
+        if call.kwargs
+    ]
+    assert len(searched) == 150
+    assert searched[-1] == "spaces/B49"
+
+
+@pytest.mark.asyncio
+@patch("gchat.chat_tools._resolve_sender", new_callable=AsyncMock)
 async def test_search_messages_query_only_filters_client_side_without_api_filter(
     mock_resolve,
 ):

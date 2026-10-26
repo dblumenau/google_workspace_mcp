@@ -436,13 +436,20 @@ async def search_messages(
             msg["_space"] = space
         context = f"space '{space_id}'"
     else:
-        # Search across all accessible spaces
-        spaces_response = await _execute_chat_request(
-            lambda: chat_service.spaces().list(pageSize=100),
-            request_label="listing accessible spaces",
-            retries=_SEARCH_MESSAGES_SSL_RETRIES,
-        )
-        spaces = spaces_response.get("spaces", [])
+        # Search across accessible spaces, paging until max_spaces are listed
+        spaces = []
+        list_params = {"pageSize": 100}
+        while True:
+            spaces_response = await _execute_chat_request(
+                lambda: chat_service.spaces().list(**list_params),
+                request_label="listing accessible spaces",
+                retries=_SEARCH_MESSAGES_SSL_RETRIES,
+            )
+            spaces.extend(spaces_response.get("spaces", []))
+            next_page_token = spaces_response.get("nextPageToken")
+            if len(spaces) >= max_spaces or not next_page_token:
+                break
+            list_params["pageToken"] = next_page_token
         spaces_to_search = spaces[:max_spaces]
         fetch_semaphore = asyncio.Semaphore(
             _SEARCH_MESSAGES_MAX_CONCURRENT_SPACE_FETCHES
