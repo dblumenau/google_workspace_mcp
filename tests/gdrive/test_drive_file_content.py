@@ -350,3 +350,23 @@ async def test_get_drive_file_content_returns_svg_markup():
         )
     assert isinstance(result, str)
     assert result.endswith(svg.decode())
+
+
+@pytest.mark.asyncio
+async def test_get_drive_file_content_bmp_is_a_file_not_an_image_block(
+    mock_resolve_image,
+):
+    mock_resolve_image.return_value[1]["mimeType"] = "image/bmp"
+    service = Mock()
+    service.files().get_media.return_value = "req"
+    with (
+        _patch_downloader(b"BM" + bytes(64)),
+        patch("gdrive.drive_tools.is_stateless_mode", return_value=True),
+    ):
+        result = await _unwrap(get_drive_file_content)(
+            service=service,
+            user_google_email="user@example.com",
+            file_id="img456",
+        )
+    assert not any(isinstance(item, ImageContent) for item in result.content)
+    assert any(isinstance(item, EmbeddedResource) for item in result.content)

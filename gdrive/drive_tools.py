@@ -35,6 +35,7 @@ from core.gcs_attachment_storage import gcs_files_enabled
 from core.utils import (
     GOOGLE_API_WRITE_RETRIES,
     IMAGE_MIME_TYPES,
+    INLINE_IMAGE_MIME_TYPES,
     OfficeXmlExtractionError,
     OfficeXmlTooLargeError,
     SVG_MIME_TYPE,
@@ -483,7 +484,9 @@ async def get_drive_file_content(
             fallback_url=fallback_url,
             stateless=is_stateless_mode(),
             transport=get_transport_mode(),
-            content_kind="image",
+            content_kind=(
+                "image" if mime_type in INLINE_IMAGE_MIME_TYPES else "resource"
+            ),
         )
 
     if mime_type in office_mime_types or mime_type == "application/pdf":
