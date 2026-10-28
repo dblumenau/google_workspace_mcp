@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-A FastMCP 3.x server exposing 12 Google Workspace services (Gmail, Drive, Calendar, Docs, Sheets, Slides, Forms, Chat, Apps Script, Tasks, Contacts, Custom Search) to MCP clients. Python 3.10+, managed with `uv`.
+A FastMCP server exposing 12 Google Workspace services (Gmail, Drive, Calendar, Docs, Sheets, Slides, Forms, Chat, Apps Script, Tasks, Contacts, Custom Search) to MCP clients. Python 3.10+, managed with `uv`.
 
 ## Commands
 
@@ -24,7 +24,7 @@ uv run workspace-cli call <tool> key=value...
 
 ## Architecture
 
-**Entry point flow.** `main.py` parses args/env, resolves which services and tool tiers to load, then *lazily imports* service modules from the `SERVICE_MODULES` map (`main.py:127`). Importing a service module is what registers its `@server.tool` functions — there is no central tool registry to edit. `core/server.py` owns the singleton `server` (FastMCP instance), middleware, and OAuth callback routes.
+**Entry point flow.** `main.py` parses args/env, resolves which services and tool tiers to load, then *lazily imports* service modules from the `SERVICE_MODULES` map in `main.py`. Importing a service module is what registers its `@server.tool` functions — there is no central tool registry to edit. `core/server.py` owns the singleton `server` (FastMCP instance), middleware, and OAuth callback routes.
 
 **Service modules** live in `g{service}/` directories (e.g. `gmail/gmail_tools.py`, `gdrive/drive_tools.py`). Each contains MCP tool functions plus a `_helpers.py` for non-tool logic. To add a service, add it to `SERVICE_MODULES` in `main.py` and `SERVICE_CONFIGS` in `auth/service_decorator.py`.
 
@@ -39,7 +39,7 @@ async def your_tool(service, param: str):
     return service.files().list().execute()        # service injected + cached (~30 min TTL)
 ```
 
-`require_google_service` (`auth/service_decorator.py:682`) resolves scope groups, injects an authenticated cached client as the first `service` arg, and attaches required scopes to the wrapper for tier/permission filtering. Use `require_multiple_services()` for tools needing several Google APIs. Scopes and scope-group names are centralized in `auth/scopes.py` — never hardcode scope URLs in tools.
+`require_google_service` (`auth/service_decorator.py`) resolves scope groups, injects an authenticated cached client as the first `service` arg, and attaches required scopes to the wrapper for tier/permission filtering. Use `require_multiple_services()` for tools needing several Google APIs. Scopes and scope-group names are centralized in `auth/scopes.py` — never hardcode scope URLs in tools.
 
 **Auth modes are mutually exclusive** (combining them is a startup error):
 - Single-user (`--single-user`): legacy, user email passed in tool calls / `USER_GOOGLE_EMAIL`.
